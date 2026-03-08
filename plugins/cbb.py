@@ -1,11 +1,11 @@
 # 小芽空投机 —— 回调按钮处理
 
-from pyrogram import __version__
+from pyrogram import __version__, filters
 from bot import Bot
 from config import OWNER_ID
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-@Bot.on_callback_query()
+@Bot.on_callback_query(filters.regex(r'^(about|close)$'))
 async def cb_handler(client: Bot, query: CallbackQuery):
     data = query.data
     if data == "about":

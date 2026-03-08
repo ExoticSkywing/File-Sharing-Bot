@@ -1,247 +1,663 @@
-import asyncio
+# 小芽空投机 —— 会话式资源收集器（/store Session）
+
 import re
-import random
-import string
-from datetime import datetime, timedelta
+import asyncio
+import secrets
+import logging
 from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery
+)
 from pyrogram.errors import FloodWait
 
 from bot import Bot
-from config import ADMINS
-from database.database import create_pack, add_pack_item, update_pack_count
+from config import ADMINS, CHANNEL_ID, STORE_SESSION_TIMEOUT, STORE_ALBUM_WAIT
 from helper_func import encode
+from database.database import create_pack, add_pack_item, update_pack_count
 
-STORE_SESSION_TIMEOUT = 600  # 10分钟超时
-STORE_ALBUM_WAIT = 1.5       # 相册消息等待时间
+logger = logging.getLogger(__name__)
 
-# URL 解析正则
-URL_PATTERNS = [
-    r'https://t\.me/([^/]+)/(\d+)-(\d+)',      # 范围公有链接
-    r'https://t\.me/c/(\d+)/(\d+)-(\d+)',      # 范围私有链接
-    r'https://t\.me/([^/]+)/(\d+)',            # 单条公有链接
-    r'https://t\.me/c/(\d+)/(\d+)',            # 单条私有链接
-    r'tg://openmessage\?.*chat_id=(\d+).*message_id=(\d+)', # tg 内部跳转协议
-]
+# ==================== 数据模型 ====================
 
+@dataclass
 class PackItem:
-    def __init__(self, item_type: str, channel_id: Optional[int] = None, message_id: Optional[int] = None, media_group_id: Optional[str] = None):
-        self.item_type = item_type
-        self.channel_id = channel_id
-        self.message_id = message_id
-        self.media_group_id = media_group_id
+    """资源包中的一个条目"""
+    message_id: int           # DB 频道中的消息 ID
+    media_group_id: str = None  # 相册分组 ID（可选）
 
+@dataclass
 class StoreSession:
-    def __init__(self, admin_id: int):
-        self.admin_id = admin_id
-        self.pack_id = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
-        self.items: List[PackItem] = []
-        self.pending_album: Dict[str, Dict] = {}  # media_group_id -> {"timer": Task, "messages": []}
-        self.created_at = datetime.now()
-        self.last_active = datetime.now()
-        self.progress_msg: Optional[Message] = None
+    """管理员的存储 Session"""
+    admin_id: int
+    pack_id: str
+    items: List[PackItem] = field(default_factory=list)
+    # 相册缓冲区：media_group_id -> list of messages
+    album_buffer: Dict[str, List[Message]] = field(default_factory=dict)
+    album_timers: Dict[str, asyncio.Task] = field(default_factory=dict)
+    # 已处理过的链接（用于编辑消息时做差量对比）
+    processed_links: Dict[int, set] = field(default_factory=dict)  # msg_id -> set of links
+    created_at: datetime = field(default_factory=datetime.now)
+    last_activity: datetime = field(default_factory=datetime.now)
+    status_message: Optional[Message] = None  # Bot 的状态提示消息
+    timeout_task: Optional[asyncio.Task] = None
 
+    def touch(self):
+        """更新最后活动时间"""
+        self.last_activity = datetime.now()
+
+# 全局活跃 Session 字典
 active_sessions: Dict[int, StoreSession] = {}
 
-def get_session(user_id: int) -> Optional[StoreSession]:
-    session = active_sessions.get(user_id)
-    if session:
-        if datetime.now() - session.last_active > timedelta(seconds=STORE_SESSION_TIMEOUT):
-            del active_sessions[user_id]
-            return None
-        session.last_active = datetime.now()
-        return session
-    return None
+# ==================== TG 链接解析器 ====================
 
-async def update_progress(client: Client, session: StoreSession):
-    text = (
-        f"**📦 当前存储会话已收录 {len(session.items)} 条资源**\n\n"
-        "你可以继续：\n"
-        "• 发送文件、图文或相册\n"
-        "• 转发频道消息\n"
-        "• 发送含有 Telegram 链接的文本（支持单条、范围或混合）\n"
-        "• 编辑刚刚发送的消息追加链接\n\n"
-        "完成后点击下方按钮："
-    )
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("✅ 结束并生成资源包", callback_data=f"finish_store_{session.pack_id}")]])
-    
-    if session.progress_msg:
-        try:
-            await session.progress_msg.edit_text(text, reply_markup=markup)
-            return
-        except Exception:
-            pass
-    
-    session.progress_msg = await client.send_message(session.admin_id, text, reply_markup=markup)
+# 支持的 TG 链接模式
+TG_LINK_PATTERNS = [
+    # 公开频道范围链接：https://t.me/channel/100-110
+    re.compile(r'https?://t\.me/([A-Za-z][A-Za-z0-9_]{3,})/((\d+)-(\d+))'),
+    # 私有频道范围链接：https://t.me/c/12345/100-110
+    re.compile(r'https?://t\.me/c/(\d+)/((\d+)-(\d+))'),
+    # 公开频道单条：https://t.me/channel/123
+    re.compile(r'https?://t\.me/([A-Za-z][A-Za-z0-9_]{3,})/(\d+)'),
+    # 私有频道单条：https://t.me/c/12345/123
+    re.compile(r'https?://t\.me/c/(\d+)/(\d+)'),
+    # tg:// 协议链接
+    re.compile(r'tg://openmessage\?.*?chat_id=(\d+).*?message_id=(\d+)'),
+]
 
-def extract_links_from_text(text: str) -> List[PackItem]:
-    items = []
-    lines = text.strip().split('\n')
-    for line in lines:
-        matched = False
-        # 解析正则匹配
-        for idx, pattern in enumerate(URL_PATTERNS):
-            matches = re.finditer(pattern, line)
-            for match in matches:
-                matched = True
-                if idx == 0 or idx == 1:
-                    # 范围链接: group 1 = channel, group 2 = start_id, group 3 = end_id
-                    channel_str = match.group(1)
-                    start_id = int(match.group(2))
-                    end_id = int(match.group(3))
-                    
-                    channel_id = None
-                    if channel_str.isdigit():
-                        channel_id = int(f"-100{channel_str}")
-                    
-                    for msg_id in range(start_id, end_id + 1):
-                        items.append(PackItem(item_type="link", channel_id=channel_id, message_id=msg_id))
-                elif idx == 2 or idx == 3:
-                    # 单条链接
-                    channel_str = match.group(1)
-                    msg_id = int(match.group(2))
-                    channel_id = None
-                    if channel_str.isdigit():
-                        channel_id = int(f"-100{channel_str}")
-                    items.append(PackItem(item_type="link", channel_id=channel_id, message_id=msg_id))
-                elif idx == 4:
-                    # tg openmessage 协议
-                    channel_str = match.group(1)
-                    msg_id = int(match.group(2))
-                    items.append(PackItem(item_type="link", channel_id=int(f"-100{channel_str}"), message_id=msg_id))
-                
-                if matched:
-                    break
-    return items
+def parse_tg_links(text: str) -> list:
+    """
+    解析文本中的所有 TG 链接，返回列表
+    每个元素为 (channel_identifier, message_ids_list)
+    channel_identifier: 用户名字符串 或 数字 ID
+    message_ids_list: [int, ...]
+    """
+    results = []
+    seen = set()  # 去重
 
-@Bot.on_message(filters.command('store') & filters.private & filters.user(ADMINS))
-async def cmd_store(client: Client, message: Message):
-    user_id = message.from_user.id
-    active_sessions[user_id] = StoreSession(admin_id=user_id)
-    await update_progress(client, active_sessions[user_id])
+    for line in text.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
 
-@Bot.on_message(filters.private & filters.user(ADMINS) & ~filters.command(['start','users','broadcast','batch','genlink','stats','store']), group=1)
-async def collect_messages(client: Client, message: Message):
-    session = get_session(message.from_user.id)
+        # 尝试匹配范围链接（优先级高）
+        # 公开频道范围
+        m = re.search(r'https?://t\.me/([A-Za-z][A-Za-z0-9_]{3,})/(\d+)-(\d+)', line)
+        if m:
+            channel = m.group(1)
+            start_id = int(m.group(2))
+            end_id = int(m.group(3))
+            for mid in range(start_id, end_id + 1):
+                key = (channel, mid)
+                if key not in seen:
+                    seen.add(key)
+                    results.append((channel, mid))
+            continue
+
+        # 私有频道范围
+        m = re.search(r'https?://t\.me/c/(\d+)/(\d+)-(\d+)', line)
+        if m:
+            channel = int(f"-100{m.group(1)}")
+            start_id = int(m.group(2))
+            end_id = int(m.group(3))
+            for mid in range(start_id, end_id + 1):
+                key = (channel, mid)
+                if key not in seen:
+                    seen.add(key)
+                    results.append((channel, mid))
+            continue
+
+        # 公开频道单条
+        m = re.search(r'https?://t\.me/([A-Za-z][A-Za-z0-9_]{3,})/(\d+)', line)
+        if m:
+            channel = m.group(1)
+            mid = int(m.group(2))
+            key = (channel, mid)
+            if key not in seen:
+                seen.add(key)
+                results.append((channel, mid))
+            continue
+
+        # 私有频道单条
+        m = re.search(r'https?://t\.me/c/(\d+)/(\d+)', line)
+        if m:
+            channel = int(f"-100{m.group(1)}")
+            mid = int(m.group(2))
+            key = (channel, mid)
+            if key not in seen:
+                seen.add(key)
+                results.append((channel, mid))
+            continue
+
+        # tg:// 协议
+        m = re.search(r'tg://openmessage\?.*?chat_id=(\d+).*?message_id=(\d+)', line)
+        if m:
+            channel = int(f"-100{m.group(1)}")
+            mid = int(m.group(2))
+            key = (channel, mid)
+            if key not in seen:
+                seen.add(key)
+                results.append((channel, mid))
+            continue
+
+    return results
+
+# ==================== Session 管理 ====================
+
+def generate_pack_id() -> str:
+    """生成 12 位随机 pack_id"""
+    return secrets.token_urlsafe(9)  # 12 字符
+
+async def start_session(admin_id: int) -> StoreSession:
+    """创建一个新的存储 Session"""
+    # 如果已有活跃 Session，先关闭
+    if admin_id in active_sessions:
+        await close_session(admin_id, cancelled=True)
+
+    pack_id = generate_pack_id()
+    session = StoreSession(admin_id=admin_id, pack_id=pack_id)
+
+    # 数据库创建资源包记录
+    create_pack(pack_id, admin_id)
+
+    active_sessions[admin_id] = session
+
+    # 启动超时定时器
+    session.timeout_task = asyncio.create_task(session_timeout_watcher(admin_id))
+
+    return session
+
+async def session_timeout_watcher(admin_id: int):
+    """监控 Session 超时"""
+    try:
+        while admin_id in active_sessions:
+            await asyncio.sleep(30)  # 每 30 秒检查一次
+            session = active_sessions.get(admin_id)
+            if not session:
+                break
+            elapsed = (datetime.now() - session.last_activity).total_seconds()
+            if elapsed >= STORE_SESSION_TIMEOUT:
+                # 超时关闭
+                try:
+                    from bot import Bot as BotClass
+                    # 无法直接访问 client，通过 status_message 通知
+                    pass
+                except Exception:
+                    pass
+                await close_session(admin_id, cancelled=True, reason="超时")
+                break
+    except asyncio.CancelledError:
+        pass
+
+async def close_session(admin_id: int, cancelled: bool = False, reason: str = None):
+    """关闭存储 Session"""
+    session = active_sessions.pop(admin_id, None)
     if not session:
-        return
-        
-    # TG Links Parser
-    if message.text:
-        links_items = extract_links_from_text(message.text)
-        if links_items:
-            session.items.extend(links_items)
-            await update_progress(client, session)
-            # 保存原消息 ID 供后续使用编辑检测
-            message.meta_store_index = len(session.items) - len(links_items)
-            return
+        return None
 
-    # 直接转发自 DB 频道单条记录
-    if message.forward_from_chat and message.forward_from_chat.id == client.db_channel.id:
-        session.items.append(PackItem(item_type="message", channel_id=client.db_channel.id, message_id=message.forward_from_message_id, media_group_id=message.media_group_id))
-        if not message.media_group_id:
-            await update_progress(client, session)
-        return
+    # 取消超时定时器
+    if session.timeout_task and not session.timeout_task.done():
+        session.timeout_task.cancel()
 
-    # 如果是其他内容，copy 到 DB 频道
-    async def _handle_copy():
+    # 取消所有相册合并定时器
+    for timer in session.album_timers.values():
+        if not timer.done():
+            timer.cancel()
+
+    if not cancelled:
+        # 正常完成：将所有条目写入数据库
+        for idx, item in enumerate(session.items):
+            add_pack_item(session.pack_id, item.message_id, idx, item.media_group_id)
+        update_pack_count(session.pack_id, len(session.items))
+
+    return session
+
+def get_session(admin_id: int) -> Optional[StoreSession]:
+    """获取管理员当前的 Session"""
+    return active_sessions.get(admin_id)
+
+# ==================== 收录处理函数 ====================
+
+async def process_media_message(client: Client, message: Message, session: StoreSession):
+    """处理直接发送/转发的媒体消息"""
+    session.touch()
+
+    # 判断是否来自 DB 频道的转发
+    is_from_db = (
+        message.forward_from_chat and
+        message.forward_from_chat.id == CHANNEL_ID
+    )
+
+    if is_from_db:
+        # 来自 DB 频道：直接记录原始 message_id，不 copy
+        db_msg_id = message.forward_from_message_id
+        session.items.append(PackItem(message_id=db_msg_id))
+        total = len(session.items)
+        rep = await message.reply_text(
+            f"✅ 已存入（来自存储频道），本包已有 <b>{total}</b> 项",
+            quote=True
+        )
+    else:
+        # 新内容：copy 到 DB 频道
+        media_type = _get_media_type_label(message)
         try:
-            post_message = await message.copy(chat_id=client.db_channel.id, disable_notification=True)
-            session.items.append(PackItem(item_type="message", channel_id=client.db_channel.id, message_id=post_message.id, media_group_id=post_message.media_group_id))
+            post = await message.copy(chat_id=CHANNEL_ID, disable_notification=True)
+            session.items.append(PackItem(message_id=post.id))
+            total = len(session.items)
+            rep = await message.reply_text(
+                f"✅ 已存入 1 {media_type}，本包已有 <b>{total}</b> 项",
+                quote=True
+            )
         except FloodWait as e:
             await asyncio.sleep(e.value)
-            post_message = await message.copy(chat_id=client.db_channel.id, disable_notification=True)
-            session.items.append(PackItem(item_type="message", channel_id=client.db_channel.id, message_id=post_message.id, media_group_id=post_message.media_group_id))
+            post = await message.copy(chat_id=CHANNEL_ID, disable_notification=True)
+            session.items.append(PackItem(message_id=post.id))
+            total = len(session.items)
+            rep = await message.reply_text(
+                f"✅ 已存入 1 {media_type}，本包已有 <b>{total}</b> 项",
+                quote=True
+            )
         except Exception as e:
-            pass
+            logger.error(f"存入失败: {e}")
+            await message.reply_text("❌ 存入失败，请重试", quote=True)
+            return
 
-    # 处理相册防抖和同步
-    if message.media_group_id:
-        group_id = message.media_group_id
-        if group_id not in session.pending_album:
-            session.pending_album[group_id] = {"messages": []}
-            
-            async def process_album():
-                await asyncio.sleep(STORE_ALBUM_WAIT)
-                album_data = session.pending_album.pop(group_id, None)
-                if album_data:
-                    for msg in album_data["messages"]:
-                        # 我们不用在这里 copy, 让外部函数处理（此处可优化批量 copy，但按顺序遍历即可）
-                        pass
-                    await update_progress(client, session)
-                    
-            session.pending_album[group_id]["timer"] = asyncio.create_task(process_album())
-        
-        session.pending_album[group_id]["messages"].append(message)
-        await _handle_copy()
+    await _refresh_status_message(client, rep, session)
 
+async def process_album_message(client: Client, message: Message, session: StoreSession):
+    """处理相册中的单条消息（缓冲后合并处理）"""
+    session.touch()
+    group_id = message.media_group_id
+
+    if group_id not in session.album_buffer:
+        session.album_buffer[group_id] = []
+
+    session.album_buffer[group_id].append(message)
+
+    # 取消旧的定时器（如果有），重新设置
+    if group_id in session.album_timers:
+        timer = session.album_timers[group_id]
+        if not timer.done():
+            timer.cancel()
+
+    # 设置合并定时器
+    session.album_timers[group_id] = asyncio.create_task(
+        _flush_album(client, session, group_id)
+    )
+
+async def _flush_album(client: Client, session: StoreSession, group_id: str):
+    """等待相册消息收集完毕后统一处理"""
+    await asyncio.sleep(STORE_ALBUM_WAIT)
+
+    messages = session.album_buffer.pop(group_id, [])
+    session.album_timers.pop(group_id, None)
+
+    if not messages:
+        return
+
+    # 按消息 ID 排序
+    messages.sort(key=lambda m: m.id)
+    first_msg = messages[0]
+
+    # 判断是否来自 DB 频道
+    is_from_db = (
+        first_msg.forward_from_chat and
+        first_msg.forward_from_chat.id == CHANNEL_ID
+    )
+
+    count = len(messages)
+    media_type = _get_media_type_label(first_msg)
+
+    if is_from_db:
+        # 来自 DB 频道的相册：直接记录原始 message_id
+        for msg in messages:
+            session.items.append(PackItem(
+                message_id=msg.forward_from_message_id,
+                media_group_id=group_id
+            ))
     else:
-        await _handle_copy()
-        await update_progress(client, session)
+        # 新内容：用 copy_media_group 整体复制，保持相册格式
+        try:
+            posted_msgs = await client.copy_media_group(
+                chat_id=CHANNEL_ID,
+                from_chat_id=first_msg.chat.id,
+                message_id=first_msg.id,
+                disable_notification=True
+            )
+            for pm in posted_msgs:
+                session.items.append(PackItem(
+                    message_id=pm.id,
+                    media_group_id=group_id
+                ))
+            count = len(posted_msgs)  # 以实际复制数量为准
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            try:
+                posted_msgs = await client.copy_media_group(
+                    chat_id=CHANNEL_ID,
+                    from_chat_id=first_msg.chat.id,
+                    message_id=first_msg.id,
+                    disable_notification=True
+                )
+                for pm in posted_msgs:
+                    session.items.append(PackItem(
+                        message_id=pm.id,
+                        media_group_id=group_id
+                    ))
+                count = len(posted_msgs)
+            except Exception as e:
+                logger.error(f"相册存入失败（FloodWait重试后）: {e}")
+                await first_msg.reply_text("❌ 相册存入失败，请重试", quote=True)
+                return
+        except Exception as e:
+            logger.error(f"相册存入失败: {e}")
+            await first_msg.reply_text("❌ 相册存入失败，请重试", quote=True)
+            return
 
-@Bot.on_edited_message(filters.private & filters.text & filters.user(ADMINS))
-async def check_edited_message(client: Client, message: Message):
+    total = len(session.items)
+    rep = await first_msg.reply_text(
+        f"✅ 已存入 {count} {media_type}（相册），本包已有 <b>{total}</b> 项",
+        quote=True
+    )
+    await _refresh_status_message(client, rep, session)
+
+async def process_link_message(client: Client, message: Message, session: StoreSession):
+    """处理包含 TG 链接的文本消息"""
+    session.touch()
+    text = message.text or ""
+    links = parse_tg_links(text)
+
+    if not links:
+        await message.reply_text("⚠️ 未识别到有效的 TG 链接", quote=True)
+        return
+
+    # 记录已处理的链接（用于编辑时差量对比）
+    link_set = {(str(ch), mid) for ch, mid in links}
+    session.processed_links[message.id] = link_set
+
+    success_count = 0
+    fail_count = 0
+    # 同一条消息里所有 visual 媒体（photo/video）打同一个 group_id，方便分发时组相册
+    visual_group_id = f"link_{message.id}"
+    has_visual = False  # 标记是否至少有一条 visual 媒体成功存入
+
+    def _is_visual(msg) -> bool:
+        return bool(msg.photo or msg.video)
+
+    for channel_id, msg_id in links:
+        try:
+            source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
+            if not source_msg or source_msg.empty:
+                fail_count += 1
+                continue
+
+            is_db = (isinstance(channel_id, int) and channel_id == CHANNEL_ID) or \
+                    (isinstance(channel_id, str) and hasattr(client.db_channel, 'username') and channel_id == client.db_channel.username)
+
+            visual = _is_visual(source_msg)
+            group_id = visual_group_id if visual else None
+
+            if is_db:
+                session.items.append(PackItem(message_id=msg_id, media_group_id=group_id))
+            else:
+                post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
+
+            if visual:
+                has_visual = True
+            success_count += 1
+
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            try:
+                source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
+                visual = _is_visual(source_msg)
+                group_id = visual_group_id if visual else None
+                post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
+                if visual:
+                    has_visual = True
+                success_count += 1
+            except Exception:
+                fail_count += 1
+        except Exception as e:
+            logger.warning(f"链接解析失败 {channel_id}/{msg_id}: {e}")
+            fail_count += 1
+
+    total = len(session.items)
+    result_text = f"✅ 已存入 {success_count} 个链接资源"
+    if fail_count > 0:
+        result_text += f"（{fail_count} 个解析失败）"
+    result_text += f"，本包已有 <b>{total}</b> 项"
+    rep = await message.reply_text(result_text, quote=True)
+    await _refresh_status_message(client, rep, session)
+
+async def process_edited_message(client: Client, message: Message, session: StoreSession):
+    """处理编辑消息（追加新增的链接）"""
+    session.touch()
+    text = message.text or ""
+    new_links = parse_tg_links(text)
+
+    if not new_links:
+        return
+
+    new_link_set = {(str(ch), mid) for ch, mid in new_links}
+    old_link_set = session.processed_links.get(message.id, set())
+
+    # 计算差量
+    added = new_link_set - old_link_set
+    if not added:
+        await message.reply_text("ℹ️ 未检测到新增链接", quote=True)
+        return
+
+    # 更新已处理链接记录
+    session.processed_links[message.id] = new_link_set
+
+    # 处理新增链接
+    success_count = 0
+    visual_group_id = f"link_{message.id}"  # 和原消息保持同一 group_id
+
+    def _is_visual(msg) -> bool:
+        return bool(msg.photo or msg.video)
+
+    for link_key in added:
+        channel_id_str, msg_id = link_key
+        try:
+            channel_id = int(channel_id_str)
+        except ValueError:
+            channel_id = channel_id_str
+
+        try:
+            source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
+            if not source_msg or source_msg.empty:
+                continue
+
+            visual = _is_visual(source_msg)
+            group_id = visual_group_id if visual else None
+
+            if (isinstance(channel_id, int) and channel_id == CHANNEL_ID):
+                session.items.append(PackItem(message_id=msg_id, media_group_id=group_id))
+            else:
+                post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
+            success_count += 1
+        except Exception as e:
+            logger.warning(f"追加链接失败 {channel_id}/{msg_id}: {e}")
+
+    total = len(session.items)
+    rep = await message.reply_text(
+        f"✅ 追加了 {success_count} 个链接，本包已有 <b>{total}</b> 项",
+        quote=True
+    )
+    await _refresh_status_message(client, rep, session)
+
+# ==================== 辅助函数 ====================
+
+def _get_media_type_label(message: Message) -> str:
+    """获取消息的媒体类型中文标签"""
+    if message.photo:
+        return "张图片"
+    elif message.video:
+        return "个视频"
+    elif message.document:
+        return "个文件"
+    elif message.audio:
+        return "个音频"
+    elif message.voice:
+        return "条语音"
+    elif message.animation:
+        return "个动图"
+    else:
+        return "条消息"
+
+def _has_media(message: Message) -> bool:
+    """检查消息是否包含媒体文件"""
+    return bool(
+        message.photo or message.video or message.document or
+        message.audio or message.voice or message.animation or
+        message.sticker
+    )
+
+async def _refresh_status_message(client: Client, reply_msg: Message, session: StoreSession):
+    """把完成/取消按钮附到最新那条回复消息上，同时清除上一条的按钮"""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{session.pack_id}")],
+        [InlineKeyboardButton("❌ 取消", callback_data=f"store_cancel_{session.pack_id}")]
+    ])
+    # 先清除上一条消息的按钮
+    if session.status_message and session.status_message.id != reply_msg.id:
+        try:
+            await session.status_message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    # 把按钮附到当前回复消息
+    try:
+        await reply_msg.edit_reply_markup(reply_markup=keyboard)
+        session.status_message = reply_msg
+    except Exception as e:
+        logger.warning(f"附加按钮到回复消息失败: {e}")
+
+# ==================== 命令处理器 ====================
+
+@Bot.on_message(filters.command('store') & filters.private & filters.user(ADMINS))
+async def store_command(client: Client, message: Message):
+    """管理员发送 /store 进入存储模式"""
+    session = await start_session(message.from_user.id)
+
+    welcome_text = (
+        "📦 <b>存储模式已开启</b>\n\n"
+        "请发送资源，支持以下方式：\n"
+        "• 直接发送 文件/图片/视频/相册\n"
+        "• 转发消息/相册\n"
+        "• 发送 TG 链接（支持范围如 100-110）\n"
+        "• 一条消息可混合多条链接\n"
+        "• 编辑已发消息可追加链接\n\n"
+        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭\n"
+        "完成后点击下方按钮 👇"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{session.pack_id}")],
+        [InlineKeyboardButton("❌ 取消", callback_data=f"store_cancel_{session.pack_id}")]
+    ])
+
+    status_msg = await message.reply_text(welcome_text, reply_markup=keyboard, quote=True)
+    session.status_message = status_msg
+
+@Bot.on_message(filters.private & filters.user(ADMINS) & ~filters.command(['start', 'store', 'users', 'broadcast', 'stats']) & filters.incoming, group=-1)
+async def session_message_handler(client: Client, message: Message):
+    """Session 期间拦截管理员发送的所有非命令消息"""
+    session = get_session(message.from_user.id)
+    if not session:
+        return  # 没有活跃 Session，交给其他 handler
+
+    # 有相册标识 → 走相册缓冲逻辑
+    if message.media_group_id:
+        await process_album_message(client, message, session)
+        return
+
+    # 有媒体文件（非相册的单条）
+    if _has_media(message):
+        await process_media_message(client, message, session)
+        return
+
+    # 纯文本 → 尝试解析 TG 链接
+    if message.text:
+        links = parse_tg_links(message.text)
+        if links:
+            await process_link_message(client, message, session)
+        else:
+            # 完全无法识别的内容
+            await message.reply_text(
+                "⚠️ 无法识别的内容。请发送文件、相册、转发消息或 TG 链接。",
+                quote=True
+            )
+        return
+
+@Bot.on_edited_message(filters.private & filters.user(ADMINS), group=-1)
+async def session_edited_handler(client: Client, message: Message):
+    """监听管理员编辑消息事件（追加链接）"""
     session = get_session(message.from_user.id)
     if not session:
         return
-    
-    # 获取原始消息长度来剔除旧的内容（在完整会话中简化做法，这里直接替换所有连接处理即可，但是由于是 append, 我们简单起见追加即可：提取最新的）
-    # 或者将原有提取过的内容全量清理？为保证幂等，可以通过 message_id 持久化保存
-    # TODO 追加更新（当前简化为仅提取新编辑的内容，或不做复杂差量）
-    links_items = extract_links_from_text(message.text)
-    if links_items:
-        # 为了防重，清空相同来源渠道内容 (由于 session.items 并没有记录来源管理员消息_id，这里用简单全匹配排重)
-        existing_signatures = {(i.channel_id, i.message_id) for i in session.items if i.item_type == 'link'}
-        added_count = 0
-        for item in links_items:
-            if (item.channel_id, item.message_id) not in existing_signatures:
-                session.items.append(item)
-                added_count += 1
-        
-        if added_count > 0:
-            await update_progress(client, session)
 
-@Bot.on_callback_query(filters.regex(r"^finish_store_"))
-async def finish_store(client: Client, query: CallbackQuery):
-    pack_id = query.data.split("_")[2]
-    user_id = query.from_user.id
-    
-    session = active_sessions.get(user_id)
-    if not session or session.pack_id != pack_id:
-        await query.answer("此存储会话已过期或已被处理，请发送 /store 重新开始", show_alert=True)
-        try:
-            await query.message.delete()
-        except:
-            pass
+    if message.text:
+        await process_edited_message(client, message, session)
+
+# ==================== 回调按钮处理 ====================
+
+@Bot.on_callback_query(filters.regex(r'^store_(done|cancel)_'))
+async def store_callback(client: Client, query: CallbackQuery):
+    """处理存储 Session 的完成/取消按钮"""
+    data = query.data
+    admin_id = query.from_user.id
+    session = get_session(admin_id)
+
+    if not session:
+        await query.answer("⚠️ 没有进行中的存储任务", show_alert=True)
         return
-        
-    await query.message.edit_text("⏳ 正在打包汇整，请稍候...")
-    
-    # 持久化到数据库
-    await create_pack(pack_id, user_id)
-    
-    for idx, item in enumerate(session.items):
-        await add_pack_item(
-            pack_id=pack_id,
-            item_type=item.item_type,
-            sort_order=idx + 1,
-            channel_id=item.channel_id,
-            message_id=item.message_id,
-            media_group_id=item.media_group_id
+
+    # 提取 action
+    if data.startswith("store_done_"):
+        pack_id = data[len("store_done_"):]
+        if pack_id != session.pack_id:
+            await query.answer("⚠️ Session 不匹配", show_alert=True)
+            return
+
+        if len(session.items) == 0:
+            await query.answer("⚠️ 还没有收录任何资源哦", show_alert=True)
+            return
+
+        # 完成 Session
+        completed_session = await close_session(admin_id, cancelled=False)
+        item_count = len(completed_session.items)
+
+        # 生成分享链接
+        base64_string = await encode(f"pack-{completed_session.pack_id}")
+        link = f"https://t.me/{client.username}?start={base64_string}"
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}')],
+        ])
+
+        await query.message.edit_text(
+            f"🎉 <b>资源包已生成！</b>\n\n"
+            f"📊 共收录 <b>{item_count}</b> 条资源\n"
+            f"🔗 分享链接：\n<code>{link}</code>",
+            reply_markup=keyboard
         )
-        
-    await update_pack_count(pack_id, len(session.items))
-    
-    # 清理 Session
-    del active_sessions[user_id]
-    
-    # 生成深链接
-    string = f"pack-{pack_id}"
-    base64_string = await encode(string)
-    link = f"https://t.me/{client.username}?start={base64_string}"
-    
-    db_items_count = len(session.items)
-    
-    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}')]])
-    await query.message.edit_text(f"🎉 资源打包成功！\n\n📊 包含 {db_items_count} 个文件或消息记录。\n\n<b>🔗 这里是你的专属领取链接：</b>\n\n{link}", reply_markup=reply_markup, disable_web_page_preview=True)
+        await query.answer("✅ 打包完成！")
+
+    elif data.startswith("store_cancel_"):
+        pack_id = data[len("store_cancel_"):]
+        if pack_id != session.pack_id:
+            await query.answer("⚠️ Session 不匹配", show_alert=True)
+            return
+
+        await close_session(admin_id, cancelled=True)
+        await query.message.edit_text("❌ 存储任务已取消")
+        await query.answer("已取消")

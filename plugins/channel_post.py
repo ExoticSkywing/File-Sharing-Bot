@@ -1,4 +1,4 @@
-#(©)Codexbotz
+# 小芽空投机 —— 频道帖子处理（管理员直接发文件时自动转存 + 生成链接）
 
 import asyncio
 from pyrogram import filters, Client
@@ -9,19 +9,20 @@ from bot import Bot
 from config import ADMINS, CHANNEL_ID, DISABLE_CHANNEL_BUTTON
 from helper_func import encode
 
-@Bot.on_message(filters.private & filters.user(ADMINS) & ~filters.command(['start','users','broadcast','batch','genlink','stats','store']))
+# 排除所有已注册命令，避免和 /store 等命令冲突
+@Bot.on_message(filters.private & filters.user(ADMINS) & ~filters.command(['start','users','broadcast','store','stats']))
 async def channel_post(client: Client, message: Message):
-    # 防止 session 干扰：如果用户在 session 状态，就跳过旧版转发
-    from plugins.store_session import get_session
-    if get_session(message.from_user.id):
+    # 如果管理员当前处于存储 Session，跳过默认处理（由 store_session.py 接管）
+    from plugins.store_session import active_sessions
+    if message.from_user.id in active_sessions:
         return
-        
-    reply_text = await message.reply_text("⏳ 正在处理中...", quote = True)
+
+    reply_text = await message.reply_text("⏳ 正在处理中...", quote=True)
     try:
-        post_message = await message.copy(chat_id = client.db_channel.id, disable_notification=True)
+        post_message = await message.copy(chat_id=client.db_channel.id, disable_notification=True)
     except FloodWait as e:
         await asyncio.sleep(e.value)
-        post_message = await message.copy(chat_id = client.db_channel.id, disable_notification=True)
+        post_message = await message.copy(chat_id=client.db_channel.id, disable_notification=True)
     except Exception as e:
         print(e)
         await reply_text.edit_text("❌ 处理失败，请稍后重试")
@@ -33,7 +34,7 @@ async def channel_post(client: Client, message: Message):
 
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}')]])
 
-    await reply_text.edit(f"<b>🔗 分享链接已生成</b>\n\n{link}", reply_markup=reply_markup, disable_web_page_preview = True)
+    await reply_text.edit(f"<b>🔗 分享链接已生成</b>\n\n{link}", reply_markup=reply_markup, disable_web_page_preview=True)
 
     if not DISABLE_CHANNEL_BUTTON:
         try:

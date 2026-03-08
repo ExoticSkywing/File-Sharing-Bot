@@ -44,10 +44,9 @@ class Bot(Client):
         # ====== 刷新 TG 命令菜单（覆盖旧 Bot 残留的命令） ======
         try:
             await self.set_bot_commands([
-                BotCommand("start", "🏠 开始使用小芽空投机"),
-                BotCommand("store", "📦 存储资源包（管理员）"),
-                BotCommand("batch", "📦 批量生成分享链接（管理员）"),
-                BotCommand("stats", "📊 查看运行状态（管理员）"),
+                BotCommand("start", "🤖 启动机器人"),
+                BotCommand("store", "🎒 开始存储内容"),
+                BotCommand("stats", "📊 查看运行状态"),
             ])
             self.LOGGER(__name__).info("✅ 命令菜单已刷新")
         except Exception as e:

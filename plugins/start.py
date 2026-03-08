@@ -1,139 +1,272 @@
-#(©)CodeXBotz
+# 小芽空投机 —— /start 命令处理（资源投递 + 用户欢迎 + 管理工具）
 
 import os
 import asyncio
+import logging
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated
 
 from bot import Bot
-from config import ADMINS, FORCE_MSG, START_MSG, CUSTOM_CAPTION, DISABLE_CHANNEL_BUTTON, PROTECT_CONTENT, START_PIC, AUTO_DELETE_TIME, AUTO_DELETE_MSG, JOIN_REQUEST_ENABLE,FORCE_SUB_CHANNEL
-from helper_func import subscribed,decode, get_messages, delete_file
-from database.database import add_user, del_user, full_userbase, present_user, get_pack_items
+from config import (
+    ADMINS, FORCE_MSG, START_MSG, CUSTOM_CAPTION, DISABLE_CHANNEL_BUTTON,
+    PROTECT_CONTENT, START_PIC, AUTO_DELETE_TIME, AUTO_DELETE_MSG,
+    JOIN_REQUEST_ENABLE, FORCE_SUB_CHANNEL, CHANNEL_ID
+)
+from helper_func import subscribed, decode, get_messages, delete_file
+from database.database import add_user, del_user, full_userbase, present_user, get_pack_items, pack_exists
+
+logger = logging.getLogger(__name__)
+
+
+def _apply_caption(msg, custom_caption):
+    """应用 CUSTOM_CAPTION（追加模式）"""
+    if custom_caption and msg.document:
+        original = "" if not msg.caption else msg.caption.html
+        return f"{original}\n\n{custom_caption}" if original else custom_caption
+    return "" if not msg.caption else msg.caption.html
+
+
+async def _deliver_pack(client: Client, message: Message, pack_id: str):
+    """投递资源包到用户"""
+    items = get_pack_items(pack_id)
+    if not items:
+        await message.reply_text("❌ 资源包不存在或已过期")
+        return
+
+    total = len(items)
+    temp_msg = await message.reply(f"✨ 资源正在空投中，共 {total} 条，请稍候...")
+
+    track_msgs = []
+    sent = 0
+
+    # 按 media_group_id 分组处理
+    # items: [(message_id, media_group_id, sort_order), ...]
+    groups = {}  # media_group_id -> [message_id, ...]
+    ordered_keys = []  # 保持顺序
+    singles = []  # 无分组的单条消息 [(sort_order, message_id), ...]
+
+    for msg_id, group_id, sort_order in items:
+        if group_id:
+            if group_id not in groups:
+                groups[group_id] = []
+                ordered_keys.append(('group', group_id, sort_order))
+            groups[group_id].append(msg_id)
+        else:
+            ordered_keys.append(('single', msg_id, sort_order))
+
+    # 按 sort_order 排序
+    ordered_keys.sort(key=lambda x: x[2])
+
+    for key_type, key_id, _ in ordered_keys:
+        if key_type == 'group':
+            # 相册：按媒体大类拆分批次推送
+            # Telegram 规则：photo/video 可混合，document/audio 可混合，但两大类不可互混
+            album_msg_ids = groups[key_id]
+            try:
+                album_msgs = await get_messages(client, album_msg_ids)
+
+                # 按大类分批：visual（photo/video）和 file（document/audio）
+                visual_batch = []
+                file_batch = []
+
+                for amsg in album_msgs:
+                    caption = _apply_caption(amsg, CUSTOM_CAPTION) if amsg == album_msgs[-1] else ("" if not amsg.caption else amsg.caption.html)
+                    if amsg.photo:
+                        visual_batch.append(InputMediaPhoto(
+                            amsg.photo.file_id, caption=caption, parse_mode=ParseMode.HTML
+                        ))
+                    elif amsg.video:
+                        visual_batch.append(InputMediaVideo(
+                            amsg.video.file_id, caption=caption, parse_mode=ParseMode.HTML
+                        ))
+                    elif amsg.document:
+                        file_batch.append(InputMediaDocument(
+                            amsg.document.file_id, caption=caption, parse_mode=ParseMode.HTML
+                        ))
+                    elif amsg.audio:
+                        file_batch.append(InputMediaAudio(
+                            amsg.audio.file_id, caption=caption, parse_mode=ParseMode.HTML
+                        ))
+
+                for batch in [visual_batch, file_batch]:
+                    if not batch:
+                        continue
+                    sent_group = await client.send_media_group(
+                        chat_id=message.from_user.id,
+                        media=batch,
+                        protect_content=PROTECT_CONTENT
+                    )
+                    track_msgs.extend(sent_group)
+                    sent += len(sent_group)
+
+                if total > 3:
+                    try:
+                        await temp_msg.edit_text(f"📥 正在空投 ({sent}/{total})...")
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger.warning(f"相册推送失败，降级为逐条推送: {e}")
+                for mid in album_msg_ids:
+                    await _send_single(client, message, mid, track_msgs)
+                    sent += 1
+
+        else:
+            # 单条消息
+            await _send_single(client, message, key_id, track_msgs)
+            sent += 1
+            if total > 3 and sent % 3 == 0:
+                try:
+                    await temp_msg.edit_text(f"📥 正在空投 ({sent}/{total})...")
+                except Exception:
+                    pass
+
+    await temp_msg.delete()
+
+    # 自动销毁
+    if track_msgs and AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
+        delete_data = await client.send_message(
+            chat_id=message.from_user.id,
+            text=AUTO_DELETE_MSG.format(time=AUTO_DELETE_TIME)
+        )
+        asyncio.create_task(delete_file(track_msgs, client, delete_data))
+
+
+async def _send_single(client, message, msg_id, track_msgs):
+    """发送单条消息（从 DB 频道 copy 到用户）"""
+    try:
+        msgs = await get_messages(client, [msg_id])
+        if not msgs:
+            return
+        msg = msgs[0]
+
+        caption = _apply_caption(msg, CUSTOM_CAPTION)
+        reply_markup = msg.reply_markup if DISABLE_CHANNEL_BUTTON else None
+
+        copied = await msg.copy(
+            chat_id=message.from_user.id,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+            protect_content=PROTECT_CONTENT
+        )
+        if copied and AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
+            track_msgs.append(copied)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        await _send_single(client, message, msg_id, track_msgs)
+    except Exception as e:
+        logger.warning(f"发送消息 {msg_id} 失败: {e}")
+
+
+async def _deliver_legacy(client: Client, message: Message, ids):
+    """投递旧格式（get-xxx）的资源"""
+    temp_msg = await message.reply("✨ 资源正在空投中，请稍候...")
+    try:
+        messages = await get_messages(client, ids)
+    except:
+        await message.reply_text("❌ 糟糕，资源提取失败了，请稍后重试~")
+        return
+    await temp_msg.delete()
+
+    track_msgs = []
+    total = len(messages)
+    sent = 0
+
+    for msg in messages:
+        caption = _apply_caption(msg, CUSTOM_CAPTION)
+        reply_markup = msg.reply_markup if DISABLE_CHANNEL_BUTTON else None
+
+        if AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
+            try:
+                copied = await msg.copy(
+                    chat_id=message.from_user.id, caption=caption,
+                    parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+                    protect_content=PROTECT_CONTENT
+                )
+                if copied:
+                    track_msgs.append(copied)
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+                copied = await msg.copy(
+                    chat_id=message.from_user.id, caption=caption,
+                    parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+                    protect_content=PROTECT_CONTENT
+                )
+                if copied:
+                    track_msgs.append(copied)
+            except Exception as e:
+                logger.warning(f"复制消息失败: {e}")
+        else:
+            try:
+                await msg.copy(
+                    chat_id=message.from_user.id, caption=caption,
+                    parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+                    protect_content=PROTECT_CONTENT
+                )
+                await asyncio.sleep(0.5)
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+                await msg.copy(
+                    chat_id=message.from_user.id, caption=caption,
+                    parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+                    protect_content=PROTECT_CONTENT
+                )
+            except:
+                pass
+
+        sent += 1
+        # 进度反馈
+        if total > 3 and sent % 3 == 0 and sent < total:
+            pass  # 旧格式不做额外进度，保持原有体验
+
+    if track_msgs:
+        delete_data = await client.send_message(
+            chat_id=message.from_user.id,
+            text=AUTO_DELETE_MSG.format(time=AUTO_DELETE_TIME)
+        )
+        asyncio.create_task(delete_file(track_msgs, client, delete_data))
 
 
 @Bot.on_message(filters.command('start') & filters.private & subscribed)
 async def start_command(client: Client, message: Message):
-    id = message.from_user.id
-    if not await present_user(id):
+    user_id = message.from_user.id
+    if not await present_user(user_id):
         try:
-            await add_user(id)
+            await add_user(user_id)
         except:
             pass
+
     text = message.text
-    if len(text)>7:
+    if len(text) > 7:
         try:
             base64_string = text.split(" ", 1)[1]
         except:
             return
+
         string = await decode(base64_string)
-        argument = string.split("-")
-        
-        # ======== 新版资源包处理 ========
-        if argument[0] == "pack" and len(argument) == 2:
-            pack_id = argument[1]
-            pack_items = await get_pack_items(pack_id)
-            if not pack_items:
-                await message.reply_text("❌ 资源包无效或为空~")
-                return
-            
-            temp_msg = await message.reply("✨ 资源正在空投中，请稍候...")
-            track_msgs = []
-            
-            # 使用从 DB 读出的列表，由于可能有相册，需要分组处理
-            # 缓冲字典：{ media_group_id: [ message_ids ] }
-            current_media_group = None
-            media_group_messages = []
-            
-            # 处理并发送单条或成组消息的内部函数
-            async def _process_and_send(msg_list):
-                if not msg_list: return
-                try:
-                    # 我们知道这些都是在同一个 channel_id 中的，因为 DB 只记录本频道或者远程频道
-                    channel_id = msg_list[0]['channel_id']
-                    # 为确保安全性，我们只发本机器人所在的记录
-                    if channel_id != client.db_channel.id:
-                        # 对于外接频道只做普通转发 TODO: 支持非本频道
-                        return
-                    
-                    ids_to_fetch = [m['message_id'] for m in msg_list]
-                    msgs = await get_messages(client, ids_to_fetch)
-                    
-                    # 组装待发的 media list
-                    if len(msgs) > 1 and current_media_group:
-                        # 相册形式发送 (原版会丢失 caption 这里可以取最后一项填充)
-                        # 为了避免 copy 丢失原版属性，我们如果使用 copyMessage 需要逐个。
-                        # 这里直接逐个 copy, 等价于单发（若需复原相册形态应转换为 InputMedia）
-                        # TODO: 暂时沿用原始逐个 copy 也可以，但我们优化先尝试保持单发逻辑不变，只要顺序对。
-                        # 此处简化：只要能取到就逐个推送
-                        pass
-                    
-                    for m in msgs:
-                        if bool(CUSTOM_CAPTION) & bool(m.document):
-                            if m.caption:
-                                caption = f"{m.caption.html}\n\n{CUSTOM_CAPTION.format(previouscaption=m.caption.html, filename=m.document.file_name)}"
-                            else:
-                                caption = CUSTOM_CAPTION.format(previouscaption="", filename=m.document.file_name)
-                        else:
-                            caption = "" if not m.caption else m.caption.html
 
-                        if DISABLE_CHANNEL_BUTTON:
-                            reply_markup = m.reply_markup
-                        else:
-                            reply_markup = None
-                            
-                        try:
-                            copied = await m.copy(chat_id=message.from_user.id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup, protect_content=PROTECT_CONTENT)
-                            if copied and AUTO_DELETE_TIME > 0:
-                                track_msgs.append(copied)
-                            await asyncio.sleep(0.5)
-                        except FloodWait as e:
-                            await asyncio.sleep(e.value)
-                            copied = await m.copy(chat_id=message.from_user.id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup, protect_content=PROTECT_CONTENT)
-                            if copied and AUTO_DELETE_TIME > 0:
-                                track_msgs.append(copied)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print(f"提取出错: {e}")
-
-            # 遍历并处理：
-            # (简化的相册处理：为了不打破 copy API 的局限，暂按原版逐个 copy，但保证顺序并统一反馈)
-            pending_ids = []
-            for item in pack_items:
-                pending_ids.append(item)
-                
-            await _process_and_send(pending_ids)
-            
-            await temp_msg.delete()
-            if track_msgs:
-                delete_data = await client.send_message(
-                    chat_id=message.from_user.id,
-                    text=AUTO_DELETE_MSG.format(time=AUTO_DELETE_TIME)
-                )
-                asyncio.create_task(delete_file(track_msgs, client, delete_data))
-                
-                # 二次提醒
-                if AUTO_DELETE_TIME > 10:
-                    async def send_reminder():
-                        await asyncio.sleep(AUTO_DELETE_TIME / 2)
-                        await client.send_message(
-                            chat_id=message.from_user.id,
-                            text=f"⏳ 提醒：剩余约 {int(AUTO_DELETE_TIME/2)} 秒后文件将自动销毁，请尽快保存！"
-                        )
-                    asyncio.create_task(send_reminder())
+        # 新格式：资源包 pack-{pack_id}
+        if string.startswith("pack-"):
+            pack_id = string[5:]
+            if pack_exists(pack_id):
+                await _deliver_pack(client, message, pack_id)
+            else:
+                await message.reply_text("❌ 资源包不存在或已过期")
             return
 
-        # ======== 兼容旧式命令 get-xxxx ========
-        elif argument[0] == "get" and len(argument) == 3:
+        # 旧格式：get-xxx 或 get-xxx-yyy
+        argument = string.split("-")
+        if len(argument) == 3:
             try:
                 start = int(int(argument[1]) / abs(client.db_channel.id))
                 end = int(int(argument[2]) / abs(client.db_channel.id))
             except:
                 return
             if start <= end:
-                ids = range(start,end+1)
+                ids = range(start, end + 1)
             else:
                 ids = []
                 i = start
@@ -142,7 +275,7 @@ async def start_command(client: Client, message: Message):
                     i -= 1
                     if i < end:
                         break
-        elif argument[0] == "get" and len(argument) == 2:
+        elif len(argument) == 2:
             try:
                 ids = [int(int(argument[1]) / abs(client.db_channel.id))]
             except:
@@ -150,92 +283,18 @@ async def start_command(client: Client, message: Message):
         else:
             return
 
-        temp_msg = await message.reply("✨ 资源正在空投中，请稍候...")
-        try:
-            messages = await get_messages(client, ids)
-        except:
-            await message.reply_text("❌ 糟糕，资源提取失败了，请稍后重试~")
-            return
-        await temp_msg.delete()
-
-        track_msgs = []
-
-        for msg in messages:
-
-            if bool(CUSTOM_CAPTION) & bool(msg.document):
-                if msg.caption:
-                    caption = f"{msg.caption.html}\n\n{CUSTOM_CAPTION.format(previouscaption=msg.caption.html, filename=msg.document.file_name)}"
-                else:
-                    caption = CUSTOM_CAPTION.format(previouscaption="", filename=msg.document.file_name)
-            else:
-                caption = "" if not msg.caption else msg.caption.html
-
-            if DISABLE_CHANNEL_BUTTON:
-                reply_markup = msg.reply_markup
-            else:
-                reply_markup = None
-
-            if AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
-
-                try:
-                    copied_msg_for_deletion = await msg.copy(chat_id=message.from_user.id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup, protect_content=PROTECT_CONTENT)
-                    if copied_msg_for_deletion:
-                        track_msgs.append(copied_msg_for_deletion)
-                    else:
-                        print("Failed to copy message, skipping.")
-
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
-                    copied_msg_for_deletion = await msg.copy(chat_id=message.from_user.id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup, protect_content=PROTECT_CONTENT)
-                    if copied_msg_for_deletion:
-                        track_msgs.append(copied_msg_for_deletion)
-                    else:
-                        print("Failed to copy message after retry, skipping.")
-
-                except Exception as e:
-                    print(f"Error copying message: {e}")
-                    pass
-
-            else:
-                try:
-                    await msg.copy(chat_id=message.from_user.id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup, protect_content=PROTECT_CONTENT)
-                    await asyncio.sleep(0.5)
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
-                    await msg.copy(chat_id=message.from_user.id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup, protect_content=PROTECT_CONTENT)
-                except:
-                    pass
-
-        if track_msgs:
-            delete_data = await client.send_message(
-                chat_id=message.from_user.id,
-                text=AUTO_DELETE_MSG.format(time=AUTO_DELETE_TIME)
-            )
-            # Schedule the file deletion task after all messages have been copied
-            asyncio.create_task(delete_file(track_msgs, client, delete_data))
-            
-            if AUTO_DELETE_TIME > 10:
-                async def send_reminder():
-                    await asyncio.sleep(AUTO_DELETE_TIME / 2)
-                    await client.send_message(
-                        chat_id=message.from_user.id,
-                        text=f"⏳ 提醒：剩余约 {int(AUTO_DELETE_TIME/2)} 秒后文件将自动销毁，请尽快保存！"
-                    )
-                asyncio.create_task(send_reminder())
-        else:
-            print("No messages to track for deletion.")
-
+        await _deliver_legacy(client, message, ids)
         return
     else:
         reply_markup = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("📦 了解小芽空投机", callback_data = "about"),
-                    InlineKeyboardButton("❌ 关闭", callback_data = "close")
+                    InlineKeyboardButton("📦 了解小芽空投机", callback_data="about"),
+                    InlineKeyboardButton("❌ 关闭", callback_data="close")
                 ]
             ]
         )
-        if START_PIC:  # Check if START_PIC has a value
+        if START_PIC:
             await message.reply_photo(
                 photo=START_PIC,
                 caption=START_MSG.format(
@@ -248,7 +307,7 @@ async def start_command(client: Client, message: Message):
                 reply_markup=reply_markup,
                 quote=True
             )
-        else:  # If START_PIC is empty, send only the text
+        else:
             await message.reply_text(
                 text=START_MSG.format(
                     first=message.from_user.first_name,
@@ -263,10 +322,10 @@ async def start_command(client: Client, message: Message):
             )
         return
 
-    
+
 #=====================================================================================##
 
-WAIT_MSG = """"<b>✨ 正在处理中...</b>"""
+WAIT_MSG = """<b>✨ 正在处理中...</b>"""
 
 REPLY_ERROR = """<code>请回复一条消息来使用此命令（不要带空格）</code>"""
 
@@ -289,7 +348,7 @@ async def not_joined(client: Client, message: Message):
         [
             InlineKeyboardButton(
                 "📢 加入频道",
-                url = ButtonUrl)
+                url=ButtonUrl)
         ]
     ]
 
@@ -297,8 +356,8 @@ async def not_joined(client: Client, message: Message):
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text = '✅ 已加入，点我重试',
-                    url = f"https://t.me/{client.username}?start={message.command[1]}"
+                    text='✅ 已加入，点我重试',
+                    url=f"https://t.me/{client.username}?start={message.command[1]}"
                 )
             ]
         )
@@ -306,16 +365,16 @@ async def not_joined(client: Client, message: Message):
         pass
 
     await message.reply(
-        text = FORCE_MSG.format(
-                first = message.from_user.first_name,
-                last = message.from_user.last_name,
-                username = None if not message.from_user.username else '@' + message.from_user.username,
-                mention = message.from_user.mention,
-                id = message.from_user.id
-            ),
-        reply_markup = InlineKeyboardMarkup(buttons),
-        quote = True,
-        disable_web_page_preview = True
+        text=FORCE_MSG.format(
+            first=message.from_user.first_name,
+            last=message.from_user.last_name,
+            username=None if not message.from_user.username else '@' + message.from_user.username,
+            mention=message.from_user.mention,
+            id=message.from_user.id
+        ),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        quote=True,
+        disable_web_page_preview=True
     )
 
 @Bot.on_message(filters.command('users') & filters.private & filters.user(ADMINS))
@@ -334,7 +393,7 @@ async def send_text(client: Bot, message: Message):
         blocked = 0
         deleted = 0
         unsuccessful = 0
-        
+
         pls_wait = await message.reply("<i>📣 正在群发消息，这可能需要一点时间...</i>")
         for chat_id in query:
             try:
@@ -354,7 +413,7 @@ async def send_text(client: Bot, message: Message):
                 unsuccessful += 1
                 pass
             total += 1
-        
+
         status = f"""<b><u>📣 群发完成</u>
 
 总用户数： <code>{total}</code>
@@ -362,11 +421,10 @@ async def send_text(client: Bot, message: Message):
 已屏蔽 Bot： <code>{blocked}</code>
 已注销账号： <code>{deleted}</code>
 发送失败： <code>{unsuccessful}</code></b>"""
-        
+
         return await pls_wait.edit(status)
 
     else:
         msg = await message.reply(REPLY_ERROR)
         await asyncio.sleep(8)
         await msg.delete()
-

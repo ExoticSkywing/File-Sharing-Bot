@@ -15,42 +15,45 @@ def _get_conn():
         autocommit=True
     )
 
-def _ensure_table():
-    """确保 fileshare_users 表存在（首次启动自动建表）"""
+def _ensure_tables():
+    """确保所有表存在（首次启动自动建表）"""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # 用户表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS fileshare_users (
                     user_id BIGINT PRIMARY KEY,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # 资源包表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS resource_packs (
-                    pack_id    VARCHAR(64) PRIMARY KEY,
+                    pack_id    VARCHAR(16) PRIMARY KEY,
                     admin_id   BIGINT NOT NULL,
                     item_count INT DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # 资源包明细表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS pack_items (
                     id         INT AUTO_INCREMENT PRIMARY KEY,
-                    pack_id    VARCHAR(64) NOT NULL,
-                    item_type  ENUM('message','link') NOT NULL,
-                    channel_id BIGINT,
-                    message_id BIGINT,
-                    media_group_id VARCHAR(64),
+                    pack_id    VARCHAR(16) NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    media_group_id VARCHAR(64) DEFAULT NULL,
                     sort_order INT NOT NULL,
                     INDEX idx_pack (pack_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
     finally:
         conn.close()
 
 # 启动时建表
-_ensure_table()
+_ensure_tables()
+
+# ==================== 用户管理 ====================
 
 async def present_user(user_id: int):
     """检查用户是否已存在"""
@@ -93,45 +96,34 @@ async def del_user(user_id: int):
     finally:
         conn.close()
 
-async def create_pack(pack_id: str, admin_id: int):
-    """创建资源包记录"""
+# ==================== 资源包管理 ====================
+
+def create_pack(pack_id: str, admin_id: int):
+    """创建资源包"""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT IGNORE INTO resource_packs (pack_id, admin_id) VALUES (%s, %s)",
+                "INSERT INTO resource_packs (pack_id, admin_id) VALUES (%s, %s)",
                 (pack_id, admin_id)
             )
     finally:
         conn.close()
 
-async def add_pack_item(pack_id: str, item_type: str, sort_order: int, channel_id=None, message_id=None, media_group_id=None):
-    """添加资源包明细"""
+def add_pack_item(pack_id: str, message_id: int, sort_order: int, media_group_id: str = None):
+    """添加资源包明细条目"""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO pack_items (pack_id, item_type, channel_id, message_id, media_group_id, sort_order) VALUES (%s, %s, %s, %s, %s, %s)",
-                (pack_id, item_type, channel_id, message_id, media_group_id, sort_order)
+                "INSERT INTO pack_items (pack_id, message_id, media_group_id, sort_order) VALUES (%s, %s, %s, %s)",
+                (pack_id, message_id, media_group_id, sort_order)
             )
     finally:
         conn.close()
 
-async def get_pack_items(pack_id: str):
-    """获取资源包的所有明细，按 sort_order 升序"""
-    conn = _get_conn()
-    try:
-        with conn.cursor(pymysql.cursors.DictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM pack_items WHERE pack_id = %s ORDER BY sort_order ASC",
-                (pack_id,)
-            )
-            return cur.fetchall()
-    finally:
-        conn.close()
-
-async def update_pack_count(pack_id: str, count: int):
-    """更新资源包的条目总数"""
+def update_pack_count(pack_id: str, count: int):
+    """更新资源包条目数"""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -139,5 +131,28 @@ async def update_pack_count(pack_id: str, count: int):
                 "UPDATE resource_packs SET item_count = %s WHERE pack_id = %s",
                 (count, pack_id)
             )
+    finally:
+        conn.close()
+
+def get_pack_items(pack_id: str):
+    """获取资源包所有条目（按 sort_order 排序）"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT message_id, media_group_id, sort_order FROM pack_items WHERE pack_id = %s ORDER BY sort_order",
+                (pack_id,)
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+def pack_exists(pack_id: str) -> bool:
+    """检查资源包是否存在"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM resource_packs WHERE pack_id = %s", (pack_id,))
+            return cur.fetchone() is not None
     finally:
         conn.close()
