@@ -1,4 +1,4 @@
-#(©)Codexbotz
+# 小芽空投机 —— 回调按钮处理
 
 from pyrogram import __version__
 from bot import Bot
@@ -10,12 +10,12 @@ async def cb_handler(client: Bot, query: CallbackQuery):
     data = query.data
     if data == "about":
         await query.message.edit_text(
-            text = f"<b>○ Creator : <a href='tg://user?id={OWNER_ID}'>This Person</a>\n○ Language : <code>Python3</code>\n○ Library : <a href='https://docs.pyrogram.org/'>Pyrogram asyncio {__version__}</a>\n○ Source Code : <a href='https://github.com/CodeXBotz/File-Sharing-Bot'>Click here</a>\n○ Channel : @CodeXBotz\n○ Support Group : @CodeXBotzSupport</b>",
+            text = f"<b>📦 小芽空投机\n\n○ 用途：资源闪电空投\n○ 支持：图片 / 视频 / 文档 / 音频等全类型\n○ 技术栈：Python3 + Pyrogram {__version__}\n○ 特性：提货口令 / 自动销毁 / 防盗转</b>",
             disable_web_page_preview = True,
             reply_markup = InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("🔒 Close", callback_data = "close")
+                        InlineKeyboardButton("❌ 关闭", callback_data = "close")
                     ]
                 ]
             )

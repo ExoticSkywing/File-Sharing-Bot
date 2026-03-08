@@ -50,11 +50,11 @@ async def start_command(client: Client, message: Message):
                 ids = [int(int(argument[1]) / abs(client.db_channel.id))]
             except:
                 return
-        temp_msg = await message.reply("Please wait...")
+        temp_msg = await message.reply("✨ 资源正在空投中，请稍候...")
         try:
             messages = await get_messages(client, ids)
         except:
-            await message.reply_text("Something went wrong..!")
+            await message.reply_text("❌ 糟糕，资源提取失败了，请稍后重试~")
             return
         await temp_msg.delete()
 
@@ -118,8 +118,8 @@ async def start_command(client: Client, message: Message):
         reply_markup = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("😊 About Me", callback_data = "about"),
-                    InlineKeyboardButton("🔒 Close", callback_data = "close")
+                    InlineKeyboardButton("📦 了解小芽空投机", callback_data = "about"),
+                    InlineKeyboardButton("❌ 关闭", callback_data = "close")
                 ]
             ]
         )
@@ -154,9 +154,9 @@ async def start_command(client: Client, message: Message):
     
 #=====================================================================================##
 
-WAIT_MSG = """"<b>Processing ...</b>"""
+WAIT_MSG = """"<b>✨ 正在处理中...</b>"""
 
-REPLY_ERROR = """<code>Use this command as a replay to any telegram message with out any spaces.</code>"""
+REPLY_ERROR = """<code>请回复一条消息来使用此命令（不要带空格）</code>"""
 
 #=====================================================================================##
 
@@ -176,7 +176,7 @@ async def not_joined(client: Client, message: Message):
     buttons = [
         [
             InlineKeyboardButton(
-                "Join Channel",
+                "📢 加入频道",
                 url = ButtonUrl)
         ]
     ]
@@ -185,7 +185,7 @@ async def not_joined(client: Client, message: Message):
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text = 'Try Again',
+                    text = '✅ 已加入，点我重试',
                     url = f"https://t.me/{client.username}?start={message.command[1]}"
                 )
             ]
@@ -210,7 +210,7 @@ async def not_joined(client: Client, message: Message):
 async def get_users(client: Bot, message: Message):
     msg = await client.send_message(chat_id=message.chat.id, text=WAIT_MSG)
     users = await full_userbase()
-    await msg.edit(f"{len(users)} users are using this bot")
+    await msg.edit(f"📊 当前共有 {len(users)} 位用户使用小芽空投机")
 
 @Bot.on_message(filters.private & filters.command('broadcast') & filters.user(ADMINS))
 async def send_text(client: Bot, message: Message):
@@ -223,7 +223,7 @@ async def send_text(client: Bot, message: Message):
         deleted = 0
         unsuccessful = 0
         
-        pls_wait = await message.reply("<i>Broadcasting Message.. This will Take Some Time</i>")
+        pls_wait = await message.reply("<i>📣 正在群发消息，这可能需要一点时间...</i>")
         for chat_id in query:
             try:
                 await broadcast_msg.copy(chat_id)
@@ -243,13 +243,13 @@ async def send_text(client: Bot, message: Message):
                 pass
             total += 1
         
-        status = f"""<b><u>Broadcast Completed</u>
+        status = f"""<b><u>📣 群发完成</u>
 
-Total Users: <code>{total}</code>
-Successful: <code>{successful}</code>
-Blocked Users: <code>{blocked}</code>
-Deleted Accounts: <code>{deleted}</code>
-Unsuccessful: <code>{unsuccessful}</code></b>"""
+总用户数： <code>{total}</code>
+成功发送： <code>{successful}</code>
+已屏蔽 Bot： <code>{blocked}</code>
+已注销账号： <code>{deleted}</code>
+发送失败： <code>{unsuccessful}</code></b>"""
         
         return await pls_wait.edit(status)
 

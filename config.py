@@ -8,65 +8,67 @@ from logging.handlers import RotatingFileHandler
 load_dotenv()
 
 #Bot token @Botfather
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8714950601:AAHJyeekNJ5EovgA7SEjm4XIbFf3iU3W2kU")
 
 #Your API ID from my.telegram.org
-APP_ID = int(os.environ.get("APP_ID", ""))
+APP_ID = int(os.environ.get("APP_ID", "22281474"))
 
 #Your API Hash from my.telegram.org
-API_HASH = os.environ.get("API_HASH", "")
+API_HASH = os.environ.get("API_HASH", "5c1e92b92eaff11128f7be19abb64adb")
 
 #Your db channel Id
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", ""))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1002046956425"))
 
 #OWNER ID
-OWNER_ID = int(os.environ.get("OWNER_ID", ""))
+OWNER_ID = int(os.environ.get("OWNER_ID", "1861667385"))
 
 #Port
-PORT = os.environ.get("PORT", "8080")
+PORT = os.environ.get("PORT", "18688")
 
-#Database 
-DB_URI = os.environ.get("DATABASE_URL", "")
-DB_NAME = os.environ.get("DATABASE_NAME", "filesharexbot")
+#Database (MySQL)
+MYSQL_HOST = os.environ.get("MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
+MYSQL_USER = os.environ.get("MYSQL_USER", "xiaoyaairdrop")
+MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "L3Ht7WJJmdAjDF6h")
+MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "xiaoyaairdrop")
 
-#force sub channel id, if you want enable force sub
-FORCE_SUB_CHANNEL = int(os.environ.get("FORCE_SUB_CHANNEL", "0"))
-JOIN_REQUEST_ENABLE = os.environ.get("JOIN_REQUEST_ENABLED", None)
+# 强制关注频道 ID
+FORCE_SUB_CHANNEL = int(os.environ.get("FORCE_SUB_CHANNEL", "-1001684212282"))
+JOIN_REQUEST_ENABLE = os.environ.get("JOIN_REQUEST_ENABLED", "True")
 
 TG_BOT_WORKERS = int(os.environ.get("TG_BOT_WORKERS", "4"))
 
 #start message
-START_PIC = os.environ.get("START_PIC","")
-START_MSG = os.environ.get("START_MESSAGE", "Hello {first}\n\nI can store private files in Specified Channel and other users can access it from special link.")
+START_PIC = os.environ.get("START_PIC","https://api.minio.1yo.cc/nebuluxe/halosparkpix/IMG_0950.webp")
+START_MSG = os.environ.get("START_MESSAGE", "✨ 嗨 {first}，欢迎使用【小芽空投机】！\n\n🎯 发送提货口令即可一键领取您的专属资源。\n📦 支持图片、视频、文档等全类型文件闪电到手。")
 try:
     ADMINS=[]
     for x in (os.environ.get("ADMINS", "").split()):
         ADMINS.append(int(x))
 except ValueError:
-        raise Exception("Your Admins list does not contain valid integers.")
+        raise Exception("管理员列表配置异常：包含非整数值，请检查 ADMINS 环境变量。")
 
 #Force sub message 
-FORCE_MSG = os.environ.get("FORCE_SUB_MESSAGE", "Hello {first}\n\n<b>You need to join in my Channel/Group to use me\n\nKindly Please join Channel</b>")
+FORCE_MSG = os.environ.get("FORCE_SUB_MESSAGE", "嗨 {first}\n\n<b>请先加入我们的频道才能使用小芽空投机哦~\n\n👇 点击下方按钮加入频道</b>")
 
-#set your Custom Caption here, Keep None for Disable Custom Caption
-CUSTOM_CAPTION = os.environ.get("CUSTOM_CAPTION", None)
+# 自定义文件描述（设为 None 则不覆盖原描述）
+CUSTOM_CAPTION = os.environ.get("CUSTOM_CAPTION", "📦 由【小芽空投机】为您投递")
 
-#set True if you want to prevent users from forwarding files from bot
-PROTECT_CONTENT = True if os.environ.get('PROTECT_CONTENT', "False") == "True" else False
+# 防止用户转发 Bot 发送的文件（True = 开启防盗转）
+PROTECT_CONTENT = True if os.environ.get('PROTECT_CONTENT', "True") == "True" else False
 
-# Auto delete time in seconds.
-AUTO_DELETE_TIME = int(os.getenv("AUTO_DELETE_TIME", "0"))
-AUTO_DELETE_MSG = os.environ.get("AUTO_DELETE_MSG", "This file will be automatically deleted in {time} seconds. Please ensure you have saved any necessary content before this time.")
-AUTO_DEL_SUCCESS_MSG = os.environ.get("AUTO_DEL_SUCCESS_MSG", "Your file has been successfully deleted. Thank you for using our service. ✅")
+# 自动销毁倒计时（秒），设为 0 则不自动删除
+AUTO_DELETE_TIME = int(os.getenv("AUTO_DELETE_TIME", "60"))
+AUTO_DELETE_MSG = os.environ.get("AUTO_DELETE_MSG", "⏳ 注意！该文件将在 {time} 秒后自动销毁")
+AUTO_DEL_SUCCESS_MSG = os.environ.get("AUTO_DEL_SUCCESS_MSG", "💨 文件已自动销毁~空投完成，感谢使用小芽空投机！")
 
-#Set true if you want Disable your Channel Posts Share button
-DISABLE_CHANNEL_BUTTON = os.environ.get("DISABLE_CHANNEL_BUTTON", None) == 'True'
+# 是否禁用频道帖子的分享按钮
+DISABLE_CHANNEL_BUTTON = os.environ.get("DISABLE_CHANNEL_BUTTON", True) == 'True'
 
-BOT_STATS_TEXT = "<b>BOT UPTIME</b>\n{uptime}"
-USER_REPLY_TEXT = "❌Don't send me messages directly I'm only File Share bot!"
+BOT_STATS_TEXT = "<b>🤖 小芽空投机运行状态</b>\n⏱ 已持续运行：{uptime}"
+USER_REPLY_TEXT = "📦 我是【小芽空投机】，请发送提货口令来领取您的资源~"
 
 ADMINS.append(OWNER_ID)
-ADMINS.append(1250450587)
 
 LOG_FILE_NAME = "filesharingbot.txt"
 
