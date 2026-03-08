@@ -45,6 +45,7 @@ class Bot(Client):
         try:
             await self.set_bot_commands([
                 BotCommand("start", "🏠 开始使用小芽空投机"),
+                BotCommand("store", "📦 存储资源包（管理员）"),
                 BotCommand("batch", "📦 批量生成分享链接（管理员）"),
                 BotCommand("stats", "📊 查看运行状态（管理员）"),
             ])

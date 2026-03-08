@@ -89,7 +89,7 @@ def get_readable_time(seconds: int) -> str:
     count = 0
     up_time = ""
     time_list = []
-    time_suffix_list = ["s", "m", "h", "days"]
+    time_suffix_list = ["秒", "分钟", "小时", "天"]
     while count < 4:
         count += 1
         remainder, result = divmod(seconds, 60) if count < 3 else divmod(seconds, 24)
@@ -113,7 +113,7 @@ async def delete_file(messages, client, process):
             await client.delete_messages(chat_id=msg.chat.id, message_ids=[msg.id])
         except Exception as e:
             await asyncio.sleep(e.x)
-            print(f"The attempt to delete the media {msg.id} was unsuccessful: {e}")
+            print(f"尝试删除媒体文件 {msg.id} 失败: {e}")
 
     await process.edit_text(AUTO_DEL_SUCCESS_MSG)
 
