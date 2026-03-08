@@ -330,7 +330,6 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
                 from_chat_id=first_msg.chat.id,
                 message_id=first_msg.id,
                 captions=captions,
-                parse_mode=ParseMode.HTML,
                 disable_notification=True
             )
             for pm in posted_msgs:
@@ -347,7 +346,6 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
                     from_chat_id=first_msg.chat.id,
                     message_id=first_msg.id,
                     captions=captions,
-                    parse_mode=ParseMode.HTML,
                     disable_notification=True
                 )
                 for pm in posted_msgs:
