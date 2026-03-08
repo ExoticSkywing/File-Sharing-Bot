@@ -642,11 +642,12 @@ async def store_callback(client: Client, query: CallbackQuery):
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}')],
+            [InlineKeyboardButton("📦 新建资源包", callback_data="store_new")],
         ])
 
         await query.message.edit_text(
             f"🎉 <b>资源包已生成！</b>\n\n"
-            f"📊 共收录 <b>{item_count}</b> 条资源\n"
+            f"📊 已存入 <b>{item_count}</b> 项资源\n"
             f"🔗 分享链接：\n<code>{link}</code>",
             reply_markup=keyboard
         )
@@ -661,3 +662,45 @@ async def store_callback(client: Client, query: CallbackQuery):
         await close_session(admin_id, cancelled=True)
         await query.message.edit_text("❌ 存储任务已取消")
         await query.answer("已取消")
+
+
+@Bot.on_callback_query(filters.regex(r'^store_new$') & filters.user(ADMINS))
+async def store_new_callback(client: Client, query: CallbackQuery):
+    """点击「新建资源包」直接开启下一个 Session"""
+    admin_id = query.from_user.id
+
+    # 如有旧 Session 先关闭
+    if get_session(admin_id):
+        await close_session(admin_id, cancelled=True)
+
+    session = await start_session(admin_id)
+
+    welcome_text = (
+        "📦 <b>新资源包已开启</b>\n\n"
+        "请发送资源，支持以下方式：\n"
+        "• 直接发送 文件/图片/视频/相册\n"
+        "• 转发消息/相册\n"
+        "• 发送 TG 链接（支持范围如 100-110）\n"
+        "• 一条消息可混合多条链接\n"
+        "• 编辑已发消息可追加链接\n\n"
+        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭\n"
+        "完成后点击下方按钮 👇"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{session.pack_id}")],
+        [InlineKeyboardButton("❌ 取消", callback_data=f"store_cancel_{session.pack_id}")]
+    ])
+
+    # 把原完成消息的按钮清掉，避免「新建资源包」按钮悬空
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    status_msg = await client.send_message(
+        chat_id=admin_id,
+        text=welcome_text,
+        reply_markup=keyboard
+    )
+    session.status_message = status_msg
+    await query.answer("📦 新资源包已开启！")
