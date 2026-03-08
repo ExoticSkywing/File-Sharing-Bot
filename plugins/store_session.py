@@ -313,6 +313,12 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
     count = len(messages)
     media_type = _get_media_type_label(first_msg)
 
+    # 中间反馈：让用户立刻知道相册已收到，正在存入
+    hint_msg = await first_msg.reply_text(
+        f"⏳ 收到 {count} {media_type}（相册），正在存入...",
+        quote=True
+    )
+
     if is_from_db:
         # 来自 DB 频道的相册：直接记录原始 message_id
         for msg in messages:
@@ -361,10 +367,13 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
             return
 
     total = len(session.items)
-    rep = await first_msg.reply_text(
-        f"✅ 已存入 {count} {media_type}（相册），本包已有 <b>{total}</b> 项",
-        quote=True
-    )
+    try:
+        await hint_msg.edit_text(
+            f"✅ 已存入 {count} {media_type}（相册），本包已有 <b>{total}</b> 项"
+        )
+        rep = hint_msg
+    except Exception:
+        rep = hint_msg
     await _refresh_status_message(client, rep, session)
 
 async def process_link_message(client: Client, message: Message, session: StoreSession):
