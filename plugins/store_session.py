@@ -322,14 +322,12 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
             ))
     else:
         # 新内容：用 copy_media_group 整体复制保持相册格式
-        # 同时通过 captions 参数传入 HTML 格式，保留粗体/斜体/链接等实体
-        captions = [msg.caption.html if msg.caption else "" for msg in messages]
+        # 不传 captions，让 Pyrogram 自动复制原始 caption + entities，保留所有格式
         try:
             posted_msgs = await client.copy_media_group(
                 chat_id=CHANNEL_ID,
                 from_chat_id=first_msg.chat.id,
                 message_id=first_msg.id,
-                captions=captions,
                 disable_notification=True
             )
             for pm in posted_msgs:
@@ -345,7 +343,6 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
                     chat_id=CHANNEL_ID,
                     from_chat_id=first_msg.chat.id,
                     message_id=first_msg.id,
-                    captions=captions,
                     disable_notification=True
                 )
                 for pm in posted_msgs:
