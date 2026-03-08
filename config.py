@@ -67,7 +67,7 @@ DISABLE_CHANNEL_BUTTON = os.environ.get("DISABLE_CHANNEL_BUTTON", True) == 'True
 
 # 存储 Session 配置
 STORE_SESSION_TIMEOUT = int(os.getenv("STORE_SESSION_TIMEOUT", "600"))  # 10分钟无操作自动关闭
-STORE_ALBUM_WAIT = float(os.getenv("STORE_ALBUM_WAIT", "1.5"))         # 相册消息合并等待秒数
+STORE_ALBUM_WAIT = float(os.getenv("STORE_ALBUM_WAIT", "0.8"))         # 相册消息合并等待秒数
 
 BOT_STATS_TEXT = "<b>🤖 小芽空投机运行状态</b>\n⏱ 已持续运行：{uptime}"
 USER_REPLY_TEXT = "📦 我是【小芽空投机】，请发送提货口令来领取您的资源~"
