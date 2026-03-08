@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery
@@ -320,43 +321,46 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
                 media_group_id=group_id
             ))
     else:
-        # 新内容：用 copy_media_group 整体复制，保持相册格式
-        try:
-            posted_msgs = await client.copy_media_group(
-                chat_id=CHANNEL_ID,
-                from_chat_id=first_msg.chat.id,
-                message_id=first_msg.id,
-                disable_notification=True
-            )
-            for pm in posted_msgs:
-                session.items.append(PackItem(
-                    message_id=pm.id,
-                    media_group_id=group_id
-                ))
-            count = len(posted_msgs)  # 以实际复制数量为准
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
+        # 新内容：逐条 copy 并明确传入 HTML caption，保留格式实体
+        success_count = 0
+        for msg in messages:
             try:
-                posted_msgs = await client.copy_media_group(
+                # 用 caption.html 保留所有标识语法（糟体/斜体/链接等）
+                cap = msg.caption.html if msg.caption else None
+                post = await msg.copy(
                     chat_id=CHANNEL_ID,
-                    from_chat_id=first_msg.chat.id,
-                    message_id=first_msg.id,
+                    caption=cap,
+                    parse_mode=ParseMode.HTML,
                     disable_notification=True
                 )
-                for pm in posted_msgs:
+                session.items.append(PackItem(
+                    message_id=post.id,
+                    media_group_id=group_id
+                ))
+                success_count += 1
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+                try:
+                    cap = msg.caption.html if msg.caption else None
+                    post = await msg.copy(
+                        chat_id=CHANNEL_ID,
+                        caption=cap,
+                        parse_mode=ParseMode.HTML,
+                        disable_notification=True
+                    )
                     session.items.append(PackItem(
-                        message_id=pm.id,
+                        message_id=post.id,
                         media_group_id=group_id
                     ))
-                count = len(posted_msgs)
+                    success_count += 1
+                except Exception as e:
+                    logger.error(f"相册条目存入失败: {e}")
             except Exception as e:
-                logger.error(f"相册存入失败（FloodWait重试后）: {e}")
-                await first_msg.reply_text("❌ 相册存入失败，请重试", quote=True)
-                return
-        except Exception as e:
-            logger.error(f"相册存入失败: {e}")
+                logger.error(f"相册条目存入失败: {e}")
+        if success_count == 0:
             await first_msg.reply_text("❌ 相册存入失败，请重试", quote=True)
             return
+        count = success_count
 
     total = len(session.items)
     rep = await first_msg.reply_text(
@@ -641,8 +645,10 @@ async def store_callback(client: Client, query: CallbackQuery):
         link = f"https://t.me/{client.username}?start={base64_string}"
 
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}')],
-            [InlineKeyboardButton("📦 新建资源包", callback_data="store_new")],
+            [
+                InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}'),
+                InlineKeyboardButton("📦 新建资源包", callback_data="store_new")
+            ],
         ])
 
         await query.message.edit_text(
