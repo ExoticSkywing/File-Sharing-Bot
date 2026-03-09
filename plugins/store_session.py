@@ -40,8 +40,10 @@ class StoreSession:
     # 相册缓冲区：media_group_id -> list of messages
     album_buffer: Dict[str, List[Message]] = field(default_factory=dict)
     album_timers: Dict[str, asyncio.Task] = field(default_factory=dict)
-    # 已处理过的链接（用于编辑消息时做差量对比）
-    processed_links: Dict[int, set] = field(default_factory=dict)  # msg_id -> set of links
+    # 方案B：链接消息只在内存中暂存，完成打包时才 copy 到 DB
+    # pending_links: msg_id -> set of (channel_id_str, msg_id) tuples
+    pending_links: Dict[int, set] = field(default_factory=dict)
+    pending_link_count: int = 0  # 待处理链接总数（用于显示）
     created_at: datetime = field(default_factory=datetime.now)
     last_activity: datetime = field(default_factory=datetime.now)
     status_message: Optional[Message] = None  # Bot 的状态提示消息
@@ -311,11 +313,11 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
     )
 
     count = len(messages)
-    media_type = _get_media_type_label(first_msg)
+    media_type, album_suffix = _get_album_label(messages)
 
     # 中间反馈：让用户立刻知道相册已收到，正在存入
     hint_msg = await first_msg.reply_text(
-        f"⏳ 收到 {count} {media_type}（相册），正在存入...",
+        f"⏳ 收到 {count} {media_type}{album_suffix}，正在存入...",
         quote=True
     )
 
@@ -367,17 +369,19 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
             return
 
     total = len(session.items)
+    # 删除中间状态消息
     try:
-        await hint_msg.edit_text(
-            f"✅ 已存入 {count} {media_type}（相册），本包已有 <b>{total}</b> 项"
-        )
-        rep = hint_msg
+        await hint_msg.delete()
     except Exception:
-        rep = hint_msg
+        pass
+    rep = await first_msg.reply_text(
+        f"✅ 已存入 {count} {media_type}{album_suffix}，本包已有 <b>{total}</b> 项",
+        quote=True
+    )
     await _refresh_status_message(client, rep, session)
 
 async def process_link_message(client: Client, message: Message, session: StoreSession):
-    """处理包含 TG 链接的文本消息"""
+    """处理包含 TG 链接的文本消息（方案B：只暂存到内存，完成时才 copy）"""
     session.touch()
     text = message.text or ""
     links = parse_tg_links(text)
@@ -386,69 +390,24 @@ async def process_link_message(client: Client, message: Message, session: StoreS
         await message.reply_text("⚠️ 未识别到有效的 TG 链接", quote=True)
         return
 
-    # 记录已处理的链接（用于编辑时差量对比）
+    # 只在内存中记录链接，不立即 copy 到 DB
     link_set = {(str(ch), mid) for ch, mid in links}
-    session.processed_links[message.id] = link_set
+    session.pending_links[message.id] = link_set
 
-    success_count = 0
-    fail_count = 0
-    # 同一条消息里所有 visual 媒体（photo/video）打同一个 group_id，方便分发时组相册
-    visual_group_id = f"link_{message.id}"
-    has_visual = False  # 标记是否至少有一条 visual 媒体成功存入
+    # 重新计算待处理链接总数
+    session.pending_link_count = sum(len(s) for s in session.pending_links.values())
 
-    def _is_visual(msg) -> bool:
-        return bool(msg.photo or msg.video)
-
-    for channel_id, msg_id in links:
-        try:
-            source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
-            if not source_msg or source_msg.empty:
-                fail_count += 1
-                continue
-
-            is_db = (isinstance(channel_id, int) and channel_id == CHANNEL_ID) or \
-                    (isinstance(channel_id, str) and hasattr(client.db_channel, 'username') and channel_id == client.db_channel.username)
-
-            visual = _is_visual(source_msg)
-            group_id = visual_group_id if visual else None
-
-            if is_db:
-                session.items.append(PackItem(message_id=msg_id, media_group_id=group_id))
-            else:
-                post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
-
-            if visual:
-                has_visual = True
-            success_count += 1
-
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            try:
-                source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
-                visual = _is_visual(source_msg)
-                group_id = visual_group_id if visual else None
-                post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
-                if visual:
-                    has_visual = True
-                success_count += 1
-            except Exception:
-                fail_count += 1
-        except Exception as e:
-            logger.warning(f"链接解析失败 {channel_id}/{msg_id}: {e}")
-            fail_count += 1
-
-    total = len(session.items)
-    result_text = f"✅ 已存入 {success_count} 个链接资源"
-    if fail_count > 0:
-        result_text += f"（{fail_count} 个解析失败）"
-    result_text += f"，本包已有 <b>{total}</b> 项"
-    rep = await message.reply_text(result_text, quote=True)
+    media_count = len(session.items)
+    total_display = media_count + session.pending_link_count
+    rep = await message.reply_text(
+        f"🔗 已记录 {len(link_set)} 个链接（完成打包时统一处理）\n"
+        f"📊 本包已有 <b>{total_display}</b> 项（{media_count} 媒体 + {session.pending_link_count} 链接）",
+        quote=True
+    )
     await _refresh_status_message(client, rep, session)
 
 async def process_edited_message(client: Client, message: Message, session: StoreSession):
-    """处理编辑消息（追加新增的链接）"""
+    """处理编辑消息（方案B：更新内存中的链接集合）"""
     session.touch()
     text = message.text or ""
     new_links = parse_tg_links(text)
@@ -457,51 +416,31 @@ async def process_edited_message(client: Client, message: Message, session: Stor
         return
 
     new_link_set = {(str(ch), mid) for ch, mid in new_links}
-    old_link_set = session.processed_links.get(message.id, set())
+    old_link_set = session.pending_links.get(message.id, set())
 
-    # 计算差量
-    added = new_link_set - old_link_set
-    if not added:
-        await message.reply_text("ℹ️ 未检测到新增链接", quote=True)
+    if new_link_set == old_link_set:
+        await message.reply_text("ℹ️ 链接未变化", quote=True)
         return
 
-    # 更新已处理链接记录
-    session.processed_links[message.id] = new_link_set
+    # 直接用最新版本覆盖（支持增加和删除）
+    session.pending_links[message.id] = new_link_set
+    session.pending_link_count = sum(len(s) for s in session.pending_links.values())
 
-    # 处理新增链接
-    success_count = 0
-    visual_group_id = f"link_{message.id}"  # 和原消息保持同一 group_id
+    added = new_link_set - old_link_set
+    removed = old_link_set - new_link_set
 
-    def _is_visual(msg) -> bool:
-        return bool(msg.photo or msg.video)
+    change_parts = []
+    if added:
+        change_parts.append(f"新增 {len(added)} 个")
+    if removed:
+        change_parts.append(f"移除 {len(removed)} 个")
+    change_text = "，".join(change_parts)
 
-    for link_key in added:
-        channel_id_str, msg_id = link_key
-        try:
-            channel_id = int(channel_id_str)
-        except ValueError:
-            channel_id = channel_id_str
-
-        try:
-            source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
-            if not source_msg or source_msg.empty:
-                continue
-
-            visual = _is_visual(source_msg)
-            group_id = visual_group_id if visual else None
-
-            if (isinstance(channel_id, int) and channel_id == CHANNEL_ID):
-                session.items.append(PackItem(message_id=msg_id, media_group_id=group_id))
-            else:
-                post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
-            success_count += 1
-        except Exception as e:
-            logger.warning(f"追加链接失败 {channel_id}/{msg_id}: {e}")
-
-    total = len(session.items)
+    media_count = len(session.items)
+    total_display = media_count + session.pending_link_count
     rep = await message.reply_text(
-        f"✅ 追加了 {success_count} 个链接，本包已有 <b>{total}</b> 项",
+        f"✅ 链接已更新（{change_text}）\n"
+        f"📊 本包已有 <b>{total_display}</b> 项（{media_count} 媒体 + {session.pending_link_count} 链接）",
         quote=True
     )
     await _refresh_status_message(client, rep, session)
@@ -509,7 +448,7 @@ async def process_edited_message(client: Client, message: Message, session: Stor
 # ==================== 辅助函数 ====================
 
 def _get_media_type_label(message: Message) -> str:
-    """获取消息的媒体类型中文标签"""
+    """获取单条消息的媒体类型中文标签"""
     if message.photo:
         return "张图片"
     elif message.video:
@@ -525,6 +464,31 @@ def _get_media_type_label(message: Message) -> str:
     else:
         return "条消息"
 
+
+def _get_album_label(messages: list) -> tuple:
+    """获取相册的标签和后缀，返回 (type_label, suffix)"""
+    types = set()
+    for msg in messages:
+        if msg.photo:
+            types.add('photo')
+        elif msg.video:
+            types.add('video')
+        elif msg.document:
+            types.add('document')
+        elif msg.audio:
+            types.add('audio')
+        else:
+            types.add('other')
+
+    if len(types) == 1:
+        t = types.pop()
+        if t == 'document':
+            return (_get_media_type_label(messages[0]), "（文件组）")
+        else:
+            return (_get_media_type_label(messages[0]), "（相册）")
+    else:
+        return ("项媒体", "（混合相册）")
+
 def _has_media(message: Message) -> bool:
     """检查消息是否包含媒体文件"""
     return bool(
@@ -536,8 +500,7 @@ def _has_media(message: Message) -> bool:
 async def _refresh_status_message(client: Client, reply_msg: Message, session: StoreSession):
     """把完成/取消按钮附到最新那条回复消息上，同时清除上一条的按钮"""
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{session.pack_id}")],
-        [InlineKeyboardButton("❌ 取消", callback_data=f"store_cancel_{session.pack_id}")]
+        [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{session.pack_id}")]
     ])
     # 先清除上一条消息的按钮
     if session.status_message and session.status_message.id != reply_msg.id:
@@ -567,12 +530,10 @@ async def store_command(client: Client, message: Message):
         "• 发送 TG 链接（支持范围如 100-110）\n"
         "• 一条消息可混合多条链接\n"
         "• 编辑已发消息可追加链接\n\n"
-        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭\n"
-        "完成后点击下方按钮 👇"
+        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭"
     )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{session.pack_id}")],
         [InlineKeyboardButton("❌ 取消", callback_data=f"store_cancel_{session.pack_id}")]
     ])
 
@@ -639,9 +600,50 @@ async def store_callback(client: Client, query: CallbackQuery):
             await query.answer("⚠️ Session 不匹配", show_alert=True)
             return
 
-        if len(session.items) == 0:
-            await query.answer("⚠️ 还没有收录任何资源哦", show_alert=True)
+        if len(session.items) == 0 and session.pending_link_count == 0:
+            await query.answer("⚠️ 还没有存入任何资源哦", show_alert=True)
             return
+
+        # 方案B：批量处理 pending_links → copy 到 DB
+        if session.pending_link_count > 0:
+            await query.answer("⏳ 正在处理链接资源...", show_alert=False)
+
+            def _is_visual(msg) -> bool:
+                return bool(msg.photo or msg.video)
+
+            for msg_id, link_set in session.pending_links.items():
+                visual_group_id = f"link_{msg_id}"
+                for channel_id_str, source_msg_id in link_set:
+                    try:
+                        channel_id = int(channel_id_str)
+                    except ValueError:
+                        channel_id = channel_id_str
+                    try:
+                        source_msg = await client.get_messages(chat_id=channel_id, message_ids=source_msg_id)
+                        if not source_msg or source_msg.empty:
+                            continue
+
+                        is_db = (isinstance(channel_id, int) and channel_id == CHANNEL_ID)
+                        visual = _is_visual(source_msg)
+                        group_id = visual_group_id if visual else None
+
+                        if is_db:
+                            session.items.append(PackItem(message_id=source_msg_id, media_group_id=group_id))
+                        else:
+                            post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                            session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                        try:
+                            source_msg = await client.get_messages(chat_id=channel_id, message_ids=source_msg_id)
+                            visual = _is_visual(source_msg)
+                            group_id = visual_group_id if visual else None
+                            post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                            session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
+                        except Exception:
+                            logger.warning(f"链接处理失败（FloodWait重试后）: {channel_id}/{source_msg_id}")
+                    except Exception as e:
+                        logger.warning(f"链接处理失败: {channel_id}/{source_msg_id}: {e}")
 
         # 完成 Session
         completed_session = await close_session(admin_id, cancelled=False)
@@ -653,8 +655,8 @@ async def store_callback(client: Client, query: CallbackQuery):
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}'),
-                InlineKeyboardButton("📦 新建资源包", callback_data="store_new")
+                InlineKeyboardButton("📦 新建资源包", callback_data="store_new"),
+                InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}')
             ],
         ])
 
@@ -670,6 +672,11 @@ async def store_callback(client: Client, query: CallbackQuery):
         pack_id = data[len("store_cancel_"):]
         if pack_id != session.pack_id:
             await query.answer("⚠️ Session 不匹配", show_alert=True)
+            return
+
+        # 只允许在没有存入任何资源的时候取消
+        if len(session.items) > 0:
+            await query.answer("⚠️ 已有资源存入，无法取消，请完成打包", show_alert=True)
             return
 
         await close_session(admin_id, cancelled=True)
@@ -700,8 +707,7 @@ async def store_new_callback(client: Client, query: CallbackQuery):
         "完成后点击下方按钮 👇"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{session.pack_id}")],
-        [InlineKeyboardButton("❌ 取消", callback_data=f"store_cancel_{session.pack_id}")]
+        [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{session.pack_id}")]
     ])
 
     # 把原完成消息的按钮清掉，避免「新建资源包」按钮悬空
