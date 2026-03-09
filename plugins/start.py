@@ -89,6 +89,18 @@ async def _deliver_pack(client: Client, message: Message, pack_id: str):
                         file_batch.append(InputMediaAudio(
                             amsg.audio.file_id, caption=caption, parse_mode=ParseMode.HTML
                         ))
+                    else:
+                        # 非媒体消息（文本等）→ 降级为单条发送
+                        try:
+                            copied = await amsg.copy(
+                                chat_id=message.from_user.id,
+                                protect_content=PROTECT_CONTENT
+                            )
+                            if copied and AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
+                                track_msgs.append(copied)
+                            sent += 1
+                        except Exception as e:
+                            logger.warning(f"组内非媒体消息发送失败: {e}")
 
                 for batch in [visual_batch, file_batch]:
                     if not batch:

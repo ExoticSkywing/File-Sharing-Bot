@@ -77,9 +77,9 @@ TG_LINK_PATTERNS = [
 def parse_tg_links(text: str) -> list:
     """
     解析文本中的所有 TG 链接，返回列表
-    每个元素为 (channel_identifier, message_ids_list)
-    channel_identifier: 用户名字符串 或 数字 ID
-    message_ids_list: [int, ...]
+    每个元素为 (channel_identifier, [msg_id, ...], is_range)
+    - is_range=True: 范围链接，多个 id 自然成组
+    - is_range=False: 单条链接
     """
     results = []
     seen = set()  # 去重
@@ -96,11 +96,14 @@ def parse_tg_links(text: str) -> list:
             channel = m.group(1)
             start_id = int(m.group(2))
             end_id = int(m.group(3))
+            ids = []
             for mid in range(start_id, end_id + 1):
                 key = (channel, mid)
                 if key not in seen:
                     seen.add(key)
-                    results.append((channel, mid))
+                    ids.append(mid)
+            if ids:
+                results.append((channel, ids, True))
             continue
 
         # 私有频道范围
@@ -109,11 +112,14 @@ def parse_tg_links(text: str) -> list:
             channel = int(f"-100{m.group(1)}")
             start_id = int(m.group(2))
             end_id = int(m.group(3))
+            ids = []
             for mid in range(start_id, end_id + 1):
                 key = (channel, mid)
                 if key not in seen:
                     seen.add(key)
-                    results.append((channel, mid))
+                    ids.append(mid)
+            if ids:
+                results.append((channel, ids, True))
             continue
 
         # 公开频道单条
@@ -124,7 +130,7 @@ def parse_tg_links(text: str) -> list:
             key = (channel, mid)
             if key not in seen:
                 seen.add(key)
-                results.append((channel, mid))
+                results.append((channel, [mid], False))
             continue
 
         # 私有频道单条
@@ -135,7 +141,7 @@ def parse_tg_links(text: str) -> list:
             key = (channel, mid)
             if key not in seen:
                 seen.add(key)
-                results.append((channel, mid))
+                results.append((channel, [mid], False))
             continue
 
         # tg:// 协议
@@ -146,10 +152,15 @@ def parse_tg_links(text: str) -> list:
             key = (channel, mid)
             if key not in seen:
                 seen.add(key)
-                results.append((channel, mid))
+                results.append((channel, [mid], False))
             continue
 
     return results
+
+
+def count_tg_links(links: list) -> int:
+    """统计 TG 链接总条数"""
+    return sum(len(ids) for _, ids, _ in links)
 
 # ==================== Session 管理 ====================
 
@@ -393,7 +404,7 @@ async def process_text_message(client: Client, message: Message, session: StoreS
 
     # 分析预览信息
     tg_links = parse_tg_links(text)
-    link_count = len(tg_links)
+    link_count = count_tg_links(tg_links)
 
     media_count = len(session.items)
     total_display = media_count + session.pending_text_count
@@ -440,8 +451,8 @@ async def process_edited_message(client: Client, message: Message, session: Stor
     new_links = parse_tg_links(text)
 
     change_parts = []
-    if len(new_links) != len(old_links):
-        diff = len(new_links) - len(old_links)
+    if count_tg_links(new_links) != count_tg_links(old_links):
+        diff = count_tg_links(new_links) - count_tg_links(old_links)
         if diff > 0:
             change_parts.append(f"新增 {diff} 个链接")
         else:
@@ -622,7 +633,7 @@ async def store_callback(client: Client, query: CallbackQuery):
             await query.answer("⚠️ 还没有存入任何资源哦", show_alert=True)
             return
 
-        # 方案B：批量处理 pending_texts → 解析+组相册+copy 到 DB
+        # 方案B：批量处理 pending_texts → 统一变成 DB message_id + 分组
         if session.pending_text_count > 0:
             await query.answer("⏳ 开始处理...", show_alert=False)
             total_pending = session.pending_text_count
@@ -630,7 +641,6 @@ async def store_callback(client: Client, query: CallbackQuery):
 
             for src_msg_id, text in session.pending_texts.items():
                 processed += 1
-                # 实时更新进度到按钮消息
                 try:
                     await query.message.edit_text(
                         f"⏳ <b>正在处理文本资源...</b>\n\n"
@@ -639,6 +649,7 @@ async def store_callback(client: Client, query: CallbackQuery):
                     )
                 except Exception:
                     pass
+
                 tg_links = parse_tg_links(text)
 
                 if not tg_links:
@@ -653,61 +664,191 @@ async def store_callback(client: Client, query: CallbackQuery):
                         logger.warning(f"纯文本存入失败: {e}")
                     continue
 
-                # 有 TG 链接：解析每个链接对应的资源
-                # 提取消息中的非链接文字作为 caption
+                # 提取非链接文字作为独立文本
                 caption_text = _extract_non_link_text(text)
 
-                # 解析所有 TG 链接资源
-                visual_items = []   # (source_msg, channel_id) - 图/视频
-                other_items = []    # (source_msg, channel_id) - 文件/音频等
+                # ===== 第一步：统一变成 DB message_id =====
+                # range_groups: 范围链接自然分组 [(group_id, [db_msg_id, ...])]
+                # single_visual_ids: 单条视觉媒体 [db_msg_id, ...]
+                # single_other_ids: 单条非视觉媒体 [db_msg_id, ...]
+                range_groups = []
+                single_visual_ids = []
+                single_other_ids = []
 
-                for channel_id, msg_id in tg_links:
-                    try:
-                        source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
-                        if not source_msg or source_msg.empty:
-                            continue
-                        if source_msg.photo or source_msg.video:
-                            visual_items.append((source_msg, channel_id))
+                def _is_db_channel(ch_id):
+                    return (isinstance(ch_id, int) and ch_id == CHANNEL_ID) or \
+                           (isinstance(ch_id, str) and hasattr(client.db_channel, 'username') and ch_id == client.db_channel.username)
+
+                for channel_id, msg_ids, is_range in tg_links:
+                    is_db = _is_db_channel(channel_id)
+
+                    if is_range:
+                        # 范围链接：先获取消息检查类型再分组
+                        range_group_id = f"range_{src_msg_id}_{msg_ids[0]}"
+
+                        if is_db:
+                            # DB 链接：获取消息检查类型
+                            db_visual_no_cap = []  # 视觉无 caption → 组相册
+                            for mid in msg_ids:
+                                try:
+                                    src = await client.get_messages(chat_id=CHANNEL_ID, message_ids=mid)
+                                    if not src or src.empty:
+                                        continue
+                                    is_visual = bool(src.photo or src.video)
+                                    has_cap = bool(src.caption)
+                                    if is_visual and not has_cap:
+                                        db_visual_no_cap.append(mid)
+                                    else:
+                                        # 有 caption 的媒体 / 非视觉 / 文本 → 独立
+                                        single_other_ids.append(mid)
+                                except Exception as e:
+                                    logger.warning(f"DB 范围消息获取失败 {mid}: {e}")
+                                    single_other_ids.append(mid)
+                            # 无 caption 的视觉媒体组相册
+                            if len(db_visual_no_cap) >= 2:
+                                range_groups.append((range_group_id, db_visual_no_cap))
+                            elif len(db_visual_no_cap) == 1:
+                                single_other_ids.append(db_visual_no_cap[0])
                         else:
-                            other_items.append((source_msg, channel_id))
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-                        try:
-                            source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
-                            if source_msg and not source_msg.empty:
-                                if source_msg.photo or source_msg.video:
-                                    visual_items.append((source_msg, channel_id))
+                            # 外部链接：先批量获取源消息
+                            source_msgs = []
+                            for mid in msg_ids:
+                                try:
+                                    src = await client.get_messages(chat_id=channel_id, message_ids=mid)
+                                    if src and not src.empty:
+                                        source_msgs.append(src)
+                                except FloodWait as e:
+                                    await asyncio.sleep(e.value)
+                                    try:
+                                        src = await client.get_messages(chat_id=channel_id, message_ids=mid)
+                                        if src and not src.empty:
+                                            source_msgs.append(src)
+                                    except Exception:
+                                        pass
+                                except Exception as ex:
+                                    logger.warning(f"范围链接获取失败 {channel_id}/{mid}: {ex}")
+
+                            if not source_msgs:
+                                continue
+
+                            # 分离视觉和非视觉
+                            visual_srcs = [s for s in source_msgs if s.photo or s.video]
+                            other_srcs = [s for s in source_msgs if not (s.photo or s.video)]
+
+                            # 视觉媒体用 send_media_group 组相册（8取模）
+                            for vi in range(0, len(visual_srcs), 8):
+                                vbatch = visual_srcs[vi:vi+8]
+                                sub_group_id = f"{range_group_id}_{vi//8}" if len(visual_srcs) > 8 else range_group_id
+                                if len(vbatch) >= 2:
+                                    media_list = []
+                                    for vs in vbatch:
+                                        if vs.photo:
+                                            media_list.append(InputMediaPhoto(media=vs.photo.file_id, caption=vs.caption or ""))
+                                        elif vs.video:
+                                            media_list.append(InputMediaVideo(media=vs.video.file_id, caption=vs.caption or ""))
+                                    try:
+                                        posted = await client.send_media_group(
+                                            chat_id=CHANNEL_ID, media=media_list, disable_notification=True
+                                        )
+                                        range_groups.append((sub_group_id, [p.id for p in posted]))
+                                    except FloodWait as e:
+                                        await asyncio.sleep(e.value)
+                                        try:
+                                            posted = await client.send_media_group(
+                                                chat_id=CHANNEL_ID, media=media_list, disable_notification=True
+                                            )
+                                            range_groups.append((sub_group_id, [p.id for p in posted]))
+                                        except Exception as ex:
+                                            logger.warning(f"范围 send_media_group 失败: {ex}")
+                                    except Exception as e:
+                                        logger.warning(f"范围 send_media_group 失败: {e}")
                                 else:
-                                    other_items.append((source_msg, channel_id))
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        logger.warning(f"链接解析失败 {channel_id}/{msg_id}: {e}")
+                                    # 单条视觉
+                                    try:
+                                        post = await vbatch[0].copy(chat_id=CHANNEL_ID, disable_notification=True)
+                                        range_groups.append((sub_group_id, [post.id]))
+                                    except Exception as e:
+                                        logger.warning(f"范围单条 copy 失败: {e}")
 
-                # visual 媒体按 8 个一组组相册，用 send_media_group 发送真正相册
-                album_group_id_base = f"link_{src_msg_id}"
-                for i in range(0, len(visual_items), 8):
-                    batch = visual_items[i:i+8]
-                    album_group_id = f"{album_group_id_base}_{i//8}"
-                    is_last_batch = (i + len(batch) >= len(visual_items))
+                            # 非视觉逐条 copy
+                            for os_msg in other_srcs:
+                                try:
+                                    post = await os_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                                    single_other_ids.append(post.id)
+                                except Exception as e:
+                                    logger.warning(f"范围非视觉 copy 失败: {e}")
+                    else:
+                        # 单条链接：先解析源消息
+                        mid = msg_ids[0]
+                        try:
+                            if is_db:
+                                src = await client.get_messages(chat_id=CHANNEL_ID, message_ids=mid)
+                            else:
+                                src = await client.get_messages(chat_id=channel_id, message_ids=mid)
 
-                    # 构建 InputMedia 列表
-                    media_list = []
-                    for idx, (src_msg, ch_id) in enumerate(batch):
-                        is_last_in_batch = (idx == len(batch) - 1)
-                        # caption 追加到最后一批的最后一条（且没有 other_items 时）
-                        use_cap = is_last_batch and is_last_in_batch and len(other_items) == 0 and caption_text
-                        cap = caption_text if use_cap else ""
+                            if not src or src.empty:
+                                continue
 
-                        if src_msg.photo:
-                            file_id = src_msg.photo.file_id
-                            media_list.append(InputMediaPhoto(media=file_id, caption=cap))
-                        elif src_msg.video:
-                            file_id = src_msg.video.file_id
-                            media_list.append(InputMediaVideo(media=file_id, caption=cap))
+                            has_caption = bool(src.caption)
+                            is_visual = bool(src.photo or src.video)
 
-                    if len(media_list) >= 2:
-                        # 多条 → send_media_group 组相册
+                            if is_visual and not has_caption:
+                                # 无 caption 的视觉媒体 → 收集后统一组相册
+                                single_visual_ids.append((src, channel_id, is_db))
+                            else:
+                                # 有 caption 的媒体 / 非视觉媒体 → 逐条处理
+                                if is_db:
+                                    single_other_ids.append(mid)
+                                else:
+                                    post = await src.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                                    single_other_ids.append(post.id)
+                        except FloodWait as e:
+                            await asyncio.sleep(e.value)
+                            try:
+                                if is_db:
+                                    single_other_ids.append(mid)
+                                else:
+                                    src = await client.get_messages(chat_id=channel_id, message_ids=mid)
+                                    if src and not src.empty:
+                                        post = await src.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                                        single_other_ids.append(post.id)
+                            except Exception:
+                                pass
+                        except Exception as ex:
+                            logger.warning(f"单条链接处理失败 {channel_id}/{mid}: {ex}")
+
+                # ===== 第二步：记录 PackItem =====
+
+                # 范围链接：自然分组记录
+                for group_id, db_ids in range_groups:
+                    for db_id in db_ids:
+                        session.items.append(PackItem(message_id=db_id, media_group_id=group_id))
+
+                # 单条视觉媒体（无 caption）：区分 DB 和外部，凑 8 取模组相册
+                # 先分开 DB 和外部
+                db_visuals = [(s, c, d) for s, c, d in single_visual_ids if d]
+                ext_visuals = [(s, c, d) for s, c, d in single_visual_ids if not d]
+
+                # DB 视觉：只记录 message_id + 共享 group_id（不重复入库）
+                if len(db_visuals) >= 2:
+                    album_group_id = f"dbsingles_{src_msg_id}"
+                    for src_msg, ch_id, _ in db_visuals:
+                        session.items.append(PackItem(message_id=src_msg.id, media_group_id=album_group_id))
+                elif len(db_visuals) == 1:
+                    session.items.append(PackItem(message_id=db_visuals[0][0].id))
+
+                # 外部视觉：凑 8 取模，send_media_group 组真正相册
+                for i in range(0, len(ext_visuals), 8):
+                    batch = ext_visuals[i:i+8]
+                    if len(batch) >= 2:
+                        media_list = []
+                        for src_msg, ch_id, _ in batch:
+                            if src_msg.photo:
+                                media_list.append(InputMediaPhoto(media=src_msg.photo.file_id))
+                            elif src_msg.video:
+                                media_list.append(InputMediaVideo(media=src_msg.video.file_id))
+
+                        album_group_id = f"singles_{src_msg_id}_{i//8}"
                         try:
                             posted_msgs = await client.send_media_group(
                                 chat_id=CHANNEL_ID, media=media_list, disable_notification=True
@@ -726,50 +867,29 @@ async def store_callback(client: Client, query: CallbackQuery):
                                 logger.warning(f"send_media_group 失败: {ex}")
                         except Exception as e:
                             logger.warning(f"send_media_group 失败: {e}")
-                    elif len(media_list) == 1:
-                        # 只有 1 条，直接 copy
-                        src_msg, ch_id = batch[0]
+                    else:
+                        # 只有 1 条外部，直接 copy
+                        src_msg, ch_id, _ = batch[0]
                         try:
                             post = await src_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                            if caption_text and len(other_items) == 0 and is_last_batch:
-                                try:
-                                    await client.edit_message_caption(
-                                        chat_id=CHANNEL_ID, message_id=post.id, caption=caption_text
-                                    )
-                                except Exception:
-                                    pass
                             session.items.append(PackItem(message_id=post.id))
                         except Exception as e:
                             logger.warning(f"visual copy 失败: {e}")
 
-                # 非视觉资源逐条 copy
-                for idx, (src_msg, ch_id) in enumerate(other_items):
-                    is_db = (isinstance(ch_id, int) and ch_id == CHANNEL_ID)
-                    is_last_other = (idx == len(other_items) - 1)
-                    use_caption = is_last_other and caption_text
+                # 单条非视觉：逐条记录
+                for db_id in single_other_ids:
+                    session.items.append(PackItem(message_id=db_id))
+
+                # caption 作为独立文本消息发到 DB
+                if caption_text:
                     try:
-                        if is_db:
-                            session.items.append(PackItem(message_id=src_msg.id))
-                        else:
-                            post = await src_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                            if use_caption:
-                                try:
-                                    await client.edit_message_caption(
-                                        chat_id=CHANNEL_ID, message_id=post.id,
-                                        caption=caption_text
-                                    )
-                                except Exception:
-                                    pass
-                            session.items.append(PackItem(message_id=post.id))
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-                        try:
-                            post = await src_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                            session.items.append(PackItem(message_id=post.id))
-                        except Exception:
-                            pass
+                        cap_msg = await client.send_message(
+                            chat_id=CHANNEL_ID, text=caption_text,
+                            disable_web_page_preview=False, disable_notification=True
+                        )
+                        session.items.append(PackItem(message_id=cap_msg.id))
                     except Exception as e:
-                        logger.warning(f"non-visual copy 失败: {src_msg.id}: {e}")
+                        logger.warning(f"caption 文本存入失败: {e}")
 
         # 完成 Session
         completed_session = await close_session(admin_id, cancelled=False)

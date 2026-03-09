@@ -58,7 +58,7 @@ CUSTOM_CAPTION = os.environ.get("CUSTOM_CAPTION", "")
 PROTECT_CONTENT = True if os.environ.get('PROTECT_CONTENT', "True") == "True" else False
 
 # 自动销毁倒计时（秒），设为 0 则不自动删除
-AUTO_DELETE_TIME = int(os.getenv("AUTO_DELETE_TIME", "60"))
+AUTO_DELETE_TIME = int(os.getenv("AUTO_DELETE_TIME", "600"))
 AUTO_DELETE_MSG = os.environ.get("AUTO_DELETE_MSG", "⏳ 注意！该文件将在 {time} 秒后自动销毁")
 AUTO_DEL_SUCCESS_MSG = os.environ.get("AUTO_DEL_SUCCESS_MSG", "💨 文件已自动销毁~空投完成，感谢使用小芽空投机！")
 
