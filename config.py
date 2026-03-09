@@ -52,7 +52,7 @@ except ValueError:
 FORCE_MSG = os.environ.get("FORCE_SUB_MESSAGE", "嗨 {first}\n\n<b>请先加入我们的频道才能使用小芽空投机哦~\n\n👇 点击下方按钮加入频道</b>")
 
 # 自定义文件描述（设为 None 则不覆盖原描述）
-CUSTOM_CAPTION = os.environ.get("CUSTOM_CAPTION", "📦 由【小芽空投机】为您投递")
+CUSTOM_CAPTION = os.environ.get("CUSTOM_CAPTION", "")
 
 # 防止用户转发 Bot 发送的文件（True = 开启防盗转）
 PROTECT_CONTENT = True if os.environ.get('PROTECT_CONTENT', "True") == "True" else False

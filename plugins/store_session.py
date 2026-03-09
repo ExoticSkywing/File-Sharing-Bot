@@ -12,7 +12,7 @@ from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery
+    CallbackQuery, InputMediaPhoto, InputMediaVideo
 )
 from pyrogram.errors import FloodWait
 
@@ -40,10 +40,12 @@ class StoreSession:
     # 相册缓冲区：media_group_id -> list of messages
     album_buffer: Dict[str, List[Message]] = field(default_factory=dict)
     album_timers: Dict[str, asyncio.Task] = field(default_factory=dict)
-    # 方案B：链接消息只在内存中暂存，完成打包时才 copy 到 DB
-    # pending_links: msg_id -> set of (channel_id_str, msg_id) tuples
-    pending_links: Dict[int, set] = field(default_factory=dict)
-    pending_link_count: int = 0  # 待处理链接总数（用于显示）
+    # 方案B：所有文本消息延迟到完成打包时才处理
+    # pending_texts: msg_id -> 原始消息文本
+    pending_texts: Dict[int, str] = field(default_factory=dict)
+    pending_text_count: int = 0  # 待处理文本消息数（用于显示）
+    # 文本消息的回复消息记录，编辑时删除旧回复避免堆叠
+    text_reply_msgs: Dict[int, Message] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     last_activity: datetime = field(default_factory=datetime.now)
     status_message: Optional[Message] = None  # Bot 的状态提示消息
@@ -239,7 +241,7 @@ async def process_media_message(client: Client, message: Message, session: Store
         # 来自 DB 频道：直接记录原始 message_id，不 copy
         db_msg_id = message.forward_from_message_id
         session.items.append(PackItem(message_id=db_msg_id))
-        total = len(session.items)
+        total = len(session.items) + session.pending_text_count
         rep = await message.reply_text(
             f"✅ 已存入（来自存储频道），本包已有 <b>{total}</b> 项",
             quote=True
@@ -250,7 +252,7 @@ async def process_media_message(client: Client, message: Message, session: Store
         try:
             post = await message.copy(chat_id=CHANNEL_ID, disable_notification=True)
             session.items.append(PackItem(message_id=post.id))
-            total = len(session.items)
+            total = len(session.items) + session.pending_text_count
             rep = await message.reply_text(
                 f"✅ 已存入 1 {media_type}，本包已有 <b>{total}</b> 项",
                 quote=True
@@ -259,7 +261,7 @@ async def process_media_message(client: Client, message: Message, session: Store
             await asyncio.sleep(e.value)
             post = await message.copy(chat_id=CHANNEL_ID, disable_notification=True)
             session.items.append(PackItem(message_id=post.id))
-            total = len(session.items)
+            total = len(session.items) + session.pending_text_count
             rep = await message.reply_text(
                 f"✅ 已存入 1 {media_type}，本包已有 <b>{total}</b> 项",
                 quote=True
@@ -368,7 +370,7 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
             await first_msg.reply_text("❌ 相册存入失败，请重试", quote=True)
             return
 
-    total = len(session.items)
+    total = len(session.items) + session.pending_text_count
     # 删除中间状态消息
     try:
         await hint_msg.delete()
@@ -380,69 +382,82 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
     )
     await _refresh_status_message(client, rep, session)
 
-async def process_link_message(client: Client, message: Message, session: StoreSession):
-    """处理包含 TG 链接的文本消息（方案B：只暂存到内存，完成时才 copy）"""
+async def process_text_message(client: Client, message: Message, session: StoreSession):
+    """处理文本消息（方案B：暂存原始文本，完成时才解析+处理）"""
     session.touch()
     text = message.text or ""
-    links = parse_tg_links(text)
 
-    if not links:
-        await message.reply_text("⚠️ 未识别到有效的 TG 链接", quote=True)
-        return
+    # 暂存原始文本
+    session.pending_texts[message.id] = text
+    session.pending_text_count = len(session.pending_texts)
 
-    # 只在内存中记录链接，不立即 copy 到 DB
-    link_set = {(str(ch), mid) for ch, mid in links}
-    session.pending_links[message.id] = link_set
-
-    # 重新计算待处理链接总数
-    session.pending_link_count = sum(len(s) for s in session.pending_links.values())
+    # 分析预览信息
+    tg_links = parse_tg_links(text)
+    link_count = len(tg_links)
 
     media_count = len(session.items)
-    total_display = media_count + session.pending_link_count
-    rep = await message.reply_text(
-        f"🔗 已记录 {len(link_set)} 个链接（完成打包时统一处理）\n"
-        f"📊 本包已有 <b>{total_display}</b> 项（{media_count} 媒体 + {session.pending_link_count} 链接）",
-        quote=True
-    )
+    total_display = media_count + session.pending_text_count
+
+    if link_count > 0:
+        preview = f"🔗 已记录 {link_count} 个 TG 链接（完成打包时统一处理）"
+    else:
+        preview = "📝 已记录 1 条文本（完成打包时统一处理）"
+
+    preview += f"\n📊 本包已有 <b>{total_display}</b> 项（{media_count} 媒体 + {session.pending_text_count} 文本）"
+
+    rep = await message.reply_text(preview, quote=True)
+    session.text_reply_msgs[message.id] = rep
     await _refresh_status_message(client, rep, session)
 
 async def process_edited_message(client: Client, message: Message, session: StoreSession):
-    """处理编辑消息（方案B：更新内存中的链接集合）"""
+    """处理编辑消息（方案B：更新内存中的暂存文本）"""
     session.touch()
     text = message.text or ""
+    old_text = session.pending_texts.get(message.id)
+
+    # 删除旧回复避免堆叠
+    old_reply = session.text_reply_msgs.get(message.id)
+    if old_reply:
+        try:
+            await old_reply.delete()
+        except Exception:
+            pass
+
+    if old_text is None:
+        # 新消息（不在暂存中），按新消息处理
+        await process_text_message(client, message, session)
+        return
+
+    if text == old_text:
+        await message.reply_text("ℹ️ 内容未变化", quote=True)
+        return
+
+    # 更新暂存
+    session.pending_texts[message.id] = text
+
+    # 分析变化
+    old_links = parse_tg_links(old_text)
     new_links = parse_tg_links(text)
 
-    if not new_links:
-        return
-
-    new_link_set = {(str(ch), mid) for ch, mid in new_links}
-    old_link_set = session.pending_links.get(message.id, set())
-
-    if new_link_set == old_link_set:
-        await message.reply_text("ℹ️ 链接未变化", quote=True)
-        return
-
-    # 直接用最新版本覆盖（支持增加和删除）
-    session.pending_links[message.id] = new_link_set
-    session.pending_link_count = sum(len(s) for s in session.pending_links.values())
-
-    added = new_link_set - old_link_set
-    removed = old_link_set - new_link_set
-
     change_parts = []
-    if added:
-        change_parts.append(f"新增 {len(added)} 个")
-    if removed:
-        change_parts.append(f"移除 {len(removed)} 个")
+    if len(new_links) != len(old_links):
+        diff = len(new_links) - len(old_links)
+        if diff > 0:
+            change_parts.append(f"新增 {diff} 个链接")
+        else:
+            change_parts.append(f"移除 {-diff} 个链接")
+    if not change_parts:
+        change_parts.append("文本已更新")
     change_text = "，".join(change_parts)
 
     media_count = len(session.items)
-    total_display = media_count + session.pending_link_count
+    total_display = media_count + session.pending_text_count
     rep = await message.reply_text(
-        f"✅ 链接已更新（{change_text}）\n"
-        f"📊 本包已有 <b>{total_display}</b> 项（{media_count} 媒体 + {session.pending_link_count} 链接）",
+        f"✅ {change_text}\n"
+        f"📊 本包已有 <b>{total_display}</b> 项（{media_count} 媒体 + {session.pending_text_count} 文本）",
         quote=True
     )
+    session.text_reply_msgs[message.id] = rep
     await _refresh_status_message(client, rep, session)
 
 # ==================== 辅助函数 ====================
@@ -488,6 +503,17 @@ def _get_album_label(messages: list) -> tuple:
             return (_get_media_type_label(messages[0]), "（相册）")
     else:
         return ("项媒体", "（混合相册）")
+
+def _extract_non_link_text(text: str) -> str:
+    """从文本中去掉所有 TG 链接，保留剩余文字作为 caption"""
+    result = text
+    # 用所有 TG 链接模式匹配并移除
+    for pattern in TG_LINK_PATTERNS:
+        result = pattern.sub('', result)
+    # 清理多余空白行
+    lines = [line.strip() for line in result.strip().split('\n')]
+    lines = [line for line in lines if line]
+    return '\n'.join(lines)
 
 def _has_media(message: Message) -> bool:
     """检查消息是否包含媒体文件"""
@@ -557,18 +583,10 @@ async def session_message_handler(client: Client, message: Message):
         await process_media_message(client, message, session)
         return
 
-    # 纯文本 → 尝试解析 TG 链接
+    # 纯文本消息（含/不含链接）→ 统一暂存
     if message.text:
-        links = parse_tg_links(message.text)
-        if links:
-            await process_link_message(client, message, session)
-        else:
-            # 完全无法识别的内容
-            await message.reply_text(
-                "⚠️ 无法识别的内容。请发送文件、相册、转发消息或 TG 链接。",
-                quote=True
-            )
-        return
+        await process_text_message(client, message, session)
+        message.stop_propagation()
 
 @Bot.on_edited_message(filters.private & filters.user(ADMINS), group=-1)
 async def session_edited_handler(client: Client, message: Message):
@@ -600,50 +618,158 @@ async def store_callback(client: Client, query: CallbackQuery):
             await query.answer("⚠️ Session 不匹配", show_alert=True)
             return
 
-        if len(session.items) == 0 and session.pending_link_count == 0:
+        if len(session.items) == 0 and session.pending_text_count == 0:
             await query.answer("⚠️ 还没有存入任何资源哦", show_alert=True)
             return
 
-        # 方案B：批量处理 pending_links → copy 到 DB
-        if session.pending_link_count > 0:
-            await query.answer("⏳ 正在处理链接资源...", show_alert=False)
+        # 方案B：批量处理 pending_texts → 解析+组相册+copy 到 DB
+        if session.pending_text_count > 0:
+            await query.answer("⏳ 开始处理...", show_alert=False)
+            total_pending = session.pending_text_count
+            processed = 0
 
-            def _is_visual(msg) -> bool:
-                return bool(msg.photo or msg.video)
+            for src_msg_id, text in session.pending_texts.items():
+                processed += 1
+                # 实时更新进度到按钮消息
+                try:
+                    await query.message.edit_text(
+                        f"⏳ <b>正在处理文本资源...</b>\n\n"
+                        f"📊 进度：{processed}/{total_pending}\n"
+                        f"💾 已入库：<b>{len(session.items)}</b> 项"
+                    )
+                except Exception:
+                    pass
+                tg_links = parse_tg_links(text)
 
-            for msg_id, link_set in session.pending_links.items():
-                visual_group_id = f"link_{msg_id}"
-                for channel_id_str, source_msg_id in link_set:
+                if not tg_links:
+                    # 纯文本（无 TG 链接）→ 直接发到 DB 频道
                     try:
-                        channel_id = int(channel_id_str)
-                    except ValueError:
-                        channel_id = channel_id_str
+                        posted = await client.send_message(
+                            chat_id=CHANNEL_ID, text=text,
+                            disable_web_page_preview=False, disable_notification=True
+                        )
+                        session.items.append(PackItem(message_id=posted.id))
+                    except Exception as e:
+                        logger.warning(f"纯文本存入失败: {e}")
+                    continue
+
+                # 有 TG 链接：解析每个链接对应的资源
+                # 提取消息中的非链接文字作为 caption
+                caption_text = _extract_non_link_text(text)
+
+                # 解析所有 TG 链接资源
+                visual_items = []   # (source_msg, channel_id) - 图/视频
+                other_items = []    # (source_msg, channel_id) - 文件/音频等
+
+                for channel_id, msg_id in tg_links:
                     try:
-                        source_msg = await client.get_messages(chat_id=channel_id, message_ids=source_msg_id)
+                        source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
                         if not source_msg or source_msg.empty:
                             continue
-
-                        is_db = (isinstance(channel_id, int) and channel_id == CHANNEL_ID)
-                        visual = _is_visual(source_msg)
-                        group_id = visual_group_id if visual else None
-
-                        if is_db:
-                            session.items.append(PackItem(message_id=source_msg_id, media_group_id=group_id))
+                        if source_msg.photo or source_msg.video:
+                            visual_items.append((source_msg, channel_id))
                         else:
-                            post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                            session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
+                            other_items.append((source_msg, channel_id))
                     except FloodWait as e:
                         await asyncio.sleep(e.value)
                         try:
-                            source_msg = await client.get_messages(chat_id=channel_id, message_ids=source_msg_id)
-                            visual = _is_visual(source_msg)
-                            group_id = visual_group_id if visual else None
-                            post = await source_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                            session.items.append(PackItem(message_id=post.id, media_group_id=group_id))
+                            source_msg = await client.get_messages(chat_id=channel_id, message_ids=msg_id)
+                            if source_msg and not source_msg.empty:
+                                if source_msg.photo or source_msg.video:
+                                    visual_items.append((source_msg, channel_id))
+                                else:
+                                    other_items.append((source_msg, channel_id))
                         except Exception:
-                            logger.warning(f"链接处理失败（FloodWait重试后）: {channel_id}/{source_msg_id}")
+                            pass
                     except Exception as e:
-                        logger.warning(f"链接处理失败: {channel_id}/{source_msg_id}: {e}")
+                        logger.warning(f"链接解析失败 {channel_id}/{msg_id}: {e}")
+
+                # visual 媒体按 8 个一组组相册，用 send_media_group 发送真正相册
+                album_group_id_base = f"link_{src_msg_id}"
+                for i in range(0, len(visual_items), 8):
+                    batch = visual_items[i:i+8]
+                    album_group_id = f"{album_group_id_base}_{i//8}"
+                    is_last_batch = (i + len(batch) >= len(visual_items))
+
+                    # 构建 InputMedia 列表
+                    media_list = []
+                    for idx, (src_msg, ch_id) in enumerate(batch):
+                        is_last_in_batch = (idx == len(batch) - 1)
+                        # caption 追加到最后一批的最后一条（且没有 other_items 时）
+                        use_cap = is_last_batch and is_last_in_batch and len(other_items) == 0 and caption_text
+                        cap = caption_text if use_cap else ""
+
+                        if src_msg.photo:
+                            file_id = src_msg.photo.file_id
+                            media_list.append(InputMediaPhoto(media=file_id, caption=cap))
+                        elif src_msg.video:
+                            file_id = src_msg.video.file_id
+                            media_list.append(InputMediaVideo(media=file_id, caption=cap))
+
+                    if len(media_list) >= 2:
+                        # 多条 → send_media_group 组相册
+                        try:
+                            posted_msgs = await client.send_media_group(
+                                chat_id=CHANNEL_ID, media=media_list, disable_notification=True
+                            )
+                            for pm in posted_msgs:
+                                session.items.append(PackItem(message_id=pm.id, media_group_id=album_group_id))
+                        except FloodWait as e:
+                            await asyncio.sleep(e.value)
+                            try:
+                                posted_msgs = await client.send_media_group(
+                                    chat_id=CHANNEL_ID, media=media_list, disable_notification=True
+                                )
+                                for pm in posted_msgs:
+                                    session.items.append(PackItem(message_id=pm.id, media_group_id=album_group_id))
+                            except Exception as ex:
+                                logger.warning(f"send_media_group 失败: {ex}")
+                        except Exception as e:
+                            logger.warning(f"send_media_group 失败: {e}")
+                    elif len(media_list) == 1:
+                        # 只有 1 条，直接 copy
+                        src_msg, ch_id = batch[0]
+                        try:
+                            post = await src_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                            if caption_text and len(other_items) == 0 and is_last_batch:
+                                try:
+                                    await client.edit_message_caption(
+                                        chat_id=CHANNEL_ID, message_id=post.id, caption=caption_text
+                                    )
+                                except Exception:
+                                    pass
+                            session.items.append(PackItem(message_id=post.id))
+                        except Exception as e:
+                            logger.warning(f"visual copy 失败: {e}")
+
+                # 非视觉资源逐条 copy
+                for idx, (src_msg, ch_id) in enumerate(other_items):
+                    is_db = (isinstance(ch_id, int) and ch_id == CHANNEL_ID)
+                    is_last_other = (idx == len(other_items) - 1)
+                    use_caption = is_last_other and caption_text
+                    try:
+                        if is_db:
+                            session.items.append(PackItem(message_id=src_msg.id))
+                        else:
+                            post = await src_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                            if use_caption:
+                                try:
+                                    await client.edit_message_caption(
+                                        chat_id=CHANNEL_ID, message_id=post.id,
+                                        caption=caption_text
+                                    )
+                                except Exception:
+                                    pass
+                            session.items.append(PackItem(message_id=post.id))
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                        try:
+                            post = await src_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                            session.items.append(PackItem(message_id=post.id))
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.warning(f"non-visual copy 失败: {src_msg.id}: {e}")
 
         # 完成 Session
         completed_session = await close_session(admin_id, cancelled=False)
