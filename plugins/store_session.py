@@ -19,7 +19,7 @@ from pyrogram.errors import FloodWait
 from bot import Bot
 from config import ADMINS, CHANNEL_ID, STORE_SESSION_TIMEOUT, STORE_ALBUM_WAIT
 from helper_func import encode
-from database.database import create_pack, add_pack_item, update_pack_count
+from database.database import create_pack, add_pack_item, update_pack_count, finish_pack, delete_pack, get_active_packs, get_pack_item_count
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ class StoreSession:
     """管理员的存储 Session"""
     admin_id: int
     pack_id: str
+    client: Client = None  # 缓存 Pyrogram Client 引用
     items: List[PackItem] = field(default_factory=list)
     # 相册缓冲区：media_group_id -> list of messages
     album_buffer: Dict[str, List[Message]] = field(default_factory=dict)
@@ -168,14 +169,14 @@ def generate_pack_id() -> str:
     """生成 12 位随机 pack_id"""
     return secrets.token_urlsafe(9)  # 12 字符
 
-async def start_session(admin_id: int) -> StoreSession:
+async def start_session(admin_id: int, client: Client = None) -> StoreSession:
     """创建一个新的存储 Session"""
     # 如果已有活跃 Session，先关闭
     if admin_id in active_sessions:
         await close_session(admin_id, cancelled=True)
 
     pack_id = generate_pack_id()
-    session = StoreSession(admin_id=admin_id, pack_id=pack_id)
+    session = StoreSession(admin_id=admin_id, pack_id=pack_id, client=client)
 
     # 数据库创建资源包记录
     create_pack(pack_id, admin_id)
@@ -191,23 +192,52 @@ async def session_timeout_watcher(admin_id: int):
     """监控 Session 超时"""
     try:
         while admin_id in active_sessions:
-            await asyncio.sleep(30)  # 每 30 秒检查一次
+            await asyncio.sleep(min(STORE_SESSION_TIMEOUT / 3, 10))  # 检查间隔：超时值的 1/3 或 10 秒取较小
             session = active_sessions.get(admin_id)
             if not session:
                 break
             elapsed = (datetime.now() - session.last_activity).total_seconds()
             if elapsed >= STORE_SESSION_TIMEOUT:
-                # 超时关闭
-                try:
-                    from bot import Bot as BotClass
-                    # 无法直接访问 client，通过 status_message 通知
-                    pass
-                except Exception:
-                    pass
-                await close_session(admin_id, cancelled=True, reason="超时")
+                has_content = len(session.items) > 0 or session.pending_text_count > 0
+                if has_content:
+                    # 有内容 → 走完整的打包流程（和"完成打包"按钮一样）
+                    try:
+                        if session.client:
+                            await _finalize_session(session.client, session, session.status_message)
+                        else:
+                            # 无法获取 client，降级为简单完成
+                            await close_session(admin_id, cancelled=False, reason="超时自动完成")
+                            if session.status_message:
+                                try:
+                                    await session.status_message.edit_text(
+                                        f"⏱ 会话超时，已自动完成打包\n"
+                                        f"📦 共 {len(session.items)} 项资源已保存"
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        logger.warning(f"超时自动完成异常: {e}")
+                        await close_session(admin_id, cancelled=False, reason="超时自动完成")
+                else:
+                    # 无内容 → 取消
+                    await close_session(admin_id, cancelled=True, reason="超时")
+                    if session.status_message:
+                        try:
+                            await session.status_message.edit_text(
+                                "⏱ 会话已超时关闭（未发送任何资源）"
+                            )
+                        except Exception:
+                            pass
                 break
     except asyncio.CancelledError:
         pass
+
+def persist_item(session: StoreSession, item: PackItem):
+    """将条目实时写入 DB 并追加到内存列表"""
+    session.items.append(item)
+    sort_order = len(session.items) - 1
+    add_pack_item(session.pack_id, item.message_id, sort_order, item.media_group_id)
+
 
 async def close_session(admin_id: int, cancelled: bool = False, reason: str = None):
     """关闭存储 Session"""
@@ -225,10 +255,11 @@ async def close_session(admin_id: int, cancelled: bool = False, reason: str = No
             timer.cancel()
 
     if not cancelled:
-        # 正常完成：将所有条目写入数据库
-        for idx, item in enumerate(session.items):
-            add_pack_item(session.pack_id, item.message_id, idx, item.media_group_id)
-        update_pack_count(session.pack_id, len(session.items))
+        # 正常完成：标记为 done（items 已实时写入）
+        finish_pack(session.pack_id, len(session.items))
+    else:
+        # 取消：删除空包记录
+        delete_pack(session.pack_id)
 
     return session
 
@@ -251,7 +282,7 @@ async def process_media_message(client: Client, message: Message, session: Store
     if is_from_db:
         # 来自 DB 频道：直接记录原始 message_id，不 copy
         db_msg_id = message.forward_from_message_id
-        session.items.append(PackItem(message_id=db_msg_id))
+        persist_item(session, PackItem(message_id=db_msg_id))
         total = len(session.items) + session.pending_text_count
         rep = await message.reply_text(
             f"✅ 已存入（来自存储频道），本包已有 <b>{total}</b> 项",
@@ -262,7 +293,7 @@ async def process_media_message(client: Client, message: Message, session: Store
         media_type = _get_media_type_label(message)
         try:
             post = await message.copy(chat_id=CHANNEL_ID, disable_notification=True)
-            session.items.append(PackItem(message_id=post.id))
+            persist_item(session, PackItem(message_id=post.id))
             total = len(session.items) + session.pending_text_count
             rep = await message.reply_text(
                 f"✅ 已存入 1 {media_type}，本包已有 <b>{total}</b> 项",
@@ -271,7 +302,7 @@ async def process_media_message(client: Client, message: Message, session: Store
         except FloodWait as e:
             await asyncio.sleep(e.value)
             post = await message.copy(chat_id=CHANNEL_ID, disable_notification=True)
-            session.items.append(PackItem(message_id=post.id))
+            persist_item(session, PackItem(message_id=post.id))
             total = len(session.items) + session.pending_text_count
             rep = await message.reply_text(
                 f"✅ 已存入 1 {media_type}，本包已有 <b>{total}</b> 项",
@@ -337,7 +368,7 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
     if is_from_db:
         # 来自 DB 频道的相册：直接记录原始 message_id
         for msg in messages:
-            session.items.append(PackItem(
+            persist_item(session, PackItem(
                 message_id=msg.forward_from_message_id,
                 media_group_id=group_id
             ))
@@ -352,7 +383,7 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
                 disable_notification=True
             )
             for pm in posted_msgs:
-                session.items.append(PackItem(
+                persist_item(session, PackItem(
                     message_id=pm.id,
                     media_group_id=group_id
                 ))
@@ -367,7 +398,7 @@ async def _flush_album(client: Client, session: StoreSession, group_id: str):
                     disable_notification=True
                 )
                 for pm in posted_msgs:
-                    session.items.append(PackItem(
+                    persist_item(session, PackItem(
                         message_id=pm.id,
                         media_group_id=group_id
                     ))
@@ -557,7 +588,7 @@ async def _refresh_status_message(client: Client, reply_msg: Message, session: S
 @Bot.on_message(filters.command('store') & filters.private & filters.user(ADMINS))
 async def store_command(client: Client, message: Message):
     """管理员发送 /store 进入存储模式"""
-    session = await start_session(message.from_user.id)
+    session = await start_session(message.from_user.id, client=client)
 
     welcome_text = (
         "📦 <b>存储模式已开启</b>\n\n"
@@ -567,7 +598,7 @@ async def store_command(client: Client, message: Message):
         "• 发送 TG 链接（支持范围如 100-110）\n"
         "• 一条消息可混合多条链接\n"
         "• 编辑已发消息可追加链接\n\n"
-        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭"
+        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭" if STORE_SESSION_TIMEOUT >= 60 else f"⏱ {STORE_SESSION_TIMEOUT} 秒无操作自动关闭"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -609,6 +640,299 @@ async def session_edited_handler(client: Client, message: Message):
     if message.text:
         await process_edited_message(client, message, session)
 
+# ==================== 核心打包流程 ====================
+
+async def _finalize_session(client: Client, session: StoreSession, status_message: Message = None):
+    """完整的打包流程：处理 pending_texts → close_session → 生成分享链接
+    
+    超时自动完成 和 完成按钮 都调用此函数，保证逻辑一致。
+    """
+    admin_id = session.admin_id
+
+    # ===== 处理 pending_texts =====
+    if session.pending_text_count > 0:
+        total_pending = session.pending_text_count
+        processed = 0
+
+        for src_msg_id, text in session.pending_texts.items():
+            processed += 1
+            if status_message:
+                try:
+                    await status_message.edit_text(
+                        f"⏳ <b>正在处理文本资源...</b>\n\n"
+                        f"📊 进度：{processed}/{total_pending}\n"
+                        f"💾 已入库：<b>{len(session.items)}</b> 项"
+                    )
+                except Exception:
+                    pass
+
+            tg_links = parse_tg_links(text)
+
+            if not tg_links:
+                # 纯文本（无 TG 链接）→ 直接发到 DB 频道
+                try:
+                    posted = await client.send_message(
+                        chat_id=CHANNEL_ID, text=text,
+                        disable_web_page_preview=False, disable_notification=True
+                    )
+                    persist_item(session, PackItem(message_id=posted.id))
+                except Exception as e:
+                    logger.warning(f"纯文本存入失败: {e}")
+                continue
+
+            # 提取非链接文字作为独立文本
+            caption_text = _extract_non_link_text(text)
+
+            # ===== 第一步：统一变成 DB message_id =====
+            range_groups = []
+            single_visual_ids = []
+            single_other_ids = []
+
+            def _is_db_channel(ch_id):
+                return (isinstance(ch_id, int) and ch_id == CHANNEL_ID) or \
+                       (isinstance(ch_id, str) and hasattr(client.db_channel, 'username') and ch_id == client.db_channel.username)
+
+            for channel_id, msg_ids, is_range in tg_links:
+                is_db = _is_db_channel(channel_id)
+
+                if is_range:
+                    range_group_id = f"range_{src_msg_id}_{msg_ids[0]}"
+
+                    if is_db:
+                        db_visual_no_cap = []
+                        for mid in msg_ids:
+                            try:
+                                src = await client.get_messages(chat_id=CHANNEL_ID, message_ids=mid)
+                                if not src or src.empty:
+                                    continue
+                                is_visual = bool(src.photo or src.video)
+                                has_cap = bool(src.caption)
+                                if is_visual and not has_cap:
+                                    db_visual_no_cap.append(mid)
+                                else:
+                                    single_other_ids.append(mid)
+                            except Exception as e:
+                                logger.warning(f"DB 范围消息获取失败 {mid}: {e}")
+                                single_other_ids.append(mid)
+                        if len(db_visual_no_cap) >= 2:
+                            range_groups.append((range_group_id, db_visual_no_cap))
+                        elif len(db_visual_no_cap) == 1:
+                            single_other_ids.append(db_visual_no_cap[0])
+                    else:
+                        source_msgs = []
+                        for mid in msg_ids:
+                            try:
+                                src = await client.get_messages(chat_id=channel_id, message_ids=mid)
+                                if src and not src.empty:
+                                    source_msgs.append(src)
+                            except FloodWait as e:
+                                await asyncio.sleep(e.value)
+                                try:
+                                    src = await client.get_messages(chat_id=channel_id, message_ids=mid)
+                                    if src and not src.empty:
+                                        source_msgs.append(src)
+                                except Exception:
+                                    pass
+                            except Exception as ex:
+                                logger.warning(f"范围链接获取失败 {channel_id}/{mid}: {ex}")
+
+                        if not source_msgs:
+                            continue
+
+                        visual_srcs = [s for s in source_msgs if s.photo or s.video]
+                        other_srcs = [s for s in source_msgs if not (s.photo or s.video)]
+
+                        for vi in range(0, len(visual_srcs), 8):
+                            vbatch = visual_srcs[vi:vi+8]
+                            sub_group_id = f"{range_group_id}_{vi//8}" if len(visual_srcs) > 8 else range_group_id
+                            if len(vbatch) >= 2:
+                                media_list = []
+                                for vs in vbatch:
+                                    if vs.photo:
+                                        media_list.append(InputMediaPhoto(media=vs.photo.file_id, caption=vs.caption or ""))
+                                    elif vs.video:
+                                        media_list.append(InputMediaVideo(media=vs.video.file_id, caption=vs.caption or ""))
+                                try:
+                                    posted = await client.send_media_group(
+                                        chat_id=CHANNEL_ID, media=media_list, disable_notification=True
+                                    )
+                                    range_groups.append((sub_group_id, [p.id for p in posted]))
+                                except FloodWait as e:
+                                    await asyncio.sleep(e.value)
+                                    try:
+                                        posted = await client.send_media_group(
+                                            chat_id=CHANNEL_ID, media=media_list, disable_notification=True
+                                        )
+                                        range_groups.append((sub_group_id, [p.id for p in posted]))
+                                    except Exception as ex:
+                                        logger.warning(f"范围 send_media_group 失败: {ex}")
+                                except Exception as e:
+                                    logger.warning(f"范围 send_media_group 失败: {e}")
+                            else:
+                                try:
+                                    post = await vbatch[0].copy(chat_id=CHANNEL_ID, disable_notification=True)
+                                    range_groups.append((sub_group_id, [post.id]))
+                                except Exception as e:
+                                    logger.warning(f"范围单条 copy 失败: {e}")
+
+                        for os_msg in other_srcs:
+                            try:
+                                post = await os_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                                single_other_ids.append(post.id)
+                            except Exception as e:
+                                logger.warning(f"范围非视觉 copy 失败: {e}")
+                else:
+                    mid = msg_ids[0]
+                    try:
+                        if is_db:
+                            src = await client.get_messages(chat_id=CHANNEL_ID, message_ids=mid)
+                        else:
+                            src = await client.get_messages(chat_id=channel_id, message_ids=mid)
+
+                        if not src or src.empty:
+                            continue
+
+                        has_caption = bool(src.caption)
+                        is_visual = bool(src.photo or src.video)
+
+                        if is_visual and not has_caption:
+                            single_visual_ids.append((src, channel_id, is_db))
+                        else:
+                            if is_db:
+                                single_other_ids.append(mid)
+                            else:
+                                post = await src.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                                single_other_ids.append(post.id)
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                        try:
+                            if is_db:
+                                single_other_ids.append(mid)
+                            else:
+                                src = await client.get_messages(chat_id=channel_id, message_ids=mid)
+                                if src and not src.empty:
+                                    post = await src.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                                    single_other_ids.append(post.id)
+                        except Exception:
+                            pass
+                    except Exception as ex:
+                        logger.warning(f"单条链接处理失败 {channel_id}/{mid}: {ex}")
+
+            # ===== 第二步：记录 PackItem =====
+            for group_id, db_ids in range_groups:
+                for db_id in db_ids:
+                    persist_item(session, PackItem(message_id=db_id, media_group_id=group_id))
+
+            db_visuals = [(s, c, d) for s, c, d in single_visual_ids if d]
+            ext_visuals = [(s, c, d) for s, c, d in single_visual_ids if not d]
+
+            if len(db_visuals) >= 2:
+                album_group_id = f"dbsingles_{src_msg_id}"
+                for src_msg, ch_id, _ in db_visuals:
+                    persist_item(session, PackItem(message_id=src_msg.id, media_group_id=album_group_id))
+            elif len(db_visuals) == 1:
+                persist_item(session, PackItem(message_id=db_visuals[0][0].id))
+
+            for i in range(0, len(ext_visuals), 8):
+                batch = ext_visuals[i:i+8]
+                if len(batch) >= 2:
+                    media_list = []
+                    for src_msg, ch_id, _ in batch:
+                        if src_msg.photo:
+                            media_list.append(InputMediaPhoto(media=src_msg.photo.file_id))
+                        elif src_msg.video:
+                            media_list.append(InputMediaVideo(media=src_msg.video.file_id))
+
+                    album_group_id = f"singles_{src_msg_id}_{i//8}"
+                    try:
+                        posted_msgs = await client.send_media_group(
+                            chat_id=CHANNEL_ID, media=media_list, disable_notification=True
+                        )
+                        for pm in posted_msgs:
+                            persist_item(session, PackItem(message_id=pm.id, media_group_id=album_group_id))
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                        try:
+                            posted_msgs = await client.send_media_group(
+                                chat_id=CHANNEL_ID, media=media_list, disable_notification=True
+                            )
+                            for pm in posted_msgs:
+                                persist_item(session, PackItem(message_id=pm.id, media_group_id=album_group_id))
+                        except Exception as ex:
+                            logger.warning(f"send_media_group 失败: {ex}")
+                    except Exception as e:
+                        logger.warning(f"send_media_group 失败: {e}")
+                else:
+                    src_msg, ch_id, _ = batch[0]
+                    try:
+                        post = await src_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
+                        persist_item(session, PackItem(message_id=post.id))
+                    except Exception as e:
+                        logger.warning(f"visual copy 失败: {e}")
+
+            for db_id in single_other_ids:
+                persist_item(session, PackItem(message_id=db_id))
+
+            if caption_text:
+                try:
+                    cap_msg = await client.send_message(
+                        chat_id=CHANNEL_ID, text=caption_text,
+                        disable_web_page_preview=False, disable_notification=True
+                    )
+                    persist_item(session, PackItem(message_id=cap_msg.id))
+                except Exception as e:
+                    logger.warning(f"caption 文本存入失败: {e}")
+
+    # ===== 完成 Session =====
+    completed_session = await close_session(admin_id, cancelled=False)
+    item_count = len(completed_session.items)
+
+    if item_count == 0:
+        # 处理完发现没有有效内容
+        if status_message:
+            try:
+                await status_message.edit_text("⚠️ 未找到有效资源，会话已关闭")
+            except Exception:
+                pass
+        return
+
+    # 生成分享链接
+    base64_string = await encode(f"pack-{completed_session.pack_id}")
+    link = f"https://t.me/{client.username}?start={base64_string}"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📦 新建资源包", callback_data="store_new"),
+            InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}')
+        ],
+    ])
+
+    result_text = (
+        f"🎉 <b>资源包已生成！</b>\n\n"
+        f"📊 已存入 <b>{item_count}</b> 项资源\n"
+        f"🔗 分享链接：\n<code>{link}</code>"
+    )
+
+    if status_message:
+        try:
+            await status_message.edit_text(result_text, reply_markup=keyboard)
+        except Exception:
+            # 编辑失败则直接发新消息
+            try:
+                await client.send_message(
+                    chat_id=admin_id, text=result_text, reply_markup=keyboard
+                )
+            except Exception:
+                pass
+    else:
+        # 没有 status_message（如超时场景）直接发新消息
+        try:
+            await client.send_message(
+                chat_id=admin_id, text=result_text, reply_markup=keyboard
+            )
+        except Exception:
+            pass
+
 # ==================== 回调按钮处理 ====================
 
 @Bot.on_callback_query(filters.regex(r'^store_(done|cancel)_'))
@@ -633,286 +957,8 @@ async def store_callback(client: Client, query: CallbackQuery):
             await query.answer("⚠️ 还没有存入任何资源哦", show_alert=True)
             return
 
-        # 方案B：批量处理 pending_texts → 统一变成 DB message_id + 分组
-        if session.pending_text_count > 0:
-            await query.answer("⏳ 开始处理...", show_alert=False)
-            total_pending = session.pending_text_count
-            processed = 0
-
-            for src_msg_id, text in session.pending_texts.items():
-                processed += 1
-                try:
-                    await query.message.edit_text(
-                        f"⏳ <b>正在处理文本资源...</b>\n\n"
-                        f"📊 进度：{processed}/{total_pending}\n"
-                        f"💾 已入库：<b>{len(session.items)}</b> 项"
-                    )
-                except Exception:
-                    pass
-
-                tg_links = parse_tg_links(text)
-
-                if not tg_links:
-                    # 纯文本（无 TG 链接）→ 直接发到 DB 频道
-                    try:
-                        posted = await client.send_message(
-                            chat_id=CHANNEL_ID, text=text,
-                            disable_web_page_preview=False, disable_notification=True
-                        )
-                        session.items.append(PackItem(message_id=posted.id))
-                    except Exception as e:
-                        logger.warning(f"纯文本存入失败: {e}")
-                    continue
-
-                # 提取非链接文字作为独立文本
-                caption_text = _extract_non_link_text(text)
-
-                # ===== 第一步：统一变成 DB message_id =====
-                # range_groups: 范围链接自然分组 [(group_id, [db_msg_id, ...])]
-                # single_visual_ids: 单条视觉媒体 [db_msg_id, ...]
-                # single_other_ids: 单条非视觉媒体 [db_msg_id, ...]
-                range_groups = []
-                single_visual_ids = []
-                single_other_ids = []
-
-                def _is_db_channel(ch_id):
-                    return (isinstance(ch_id, int) and ch_id == CHANNEL_ID) or \
-                           (isinstance(ch_id, str) and hasattr(client.db_channel, 'username') and ch_id == client.db_channel.username)
-
-                for channel_id, msg_ids, is_range in tg_links:
-                    is_db = _is_db_channel(channel_id)
-
-                    if is_range:
-                        # 范围链接：先获取消息检查类型再分组
-                        range_group_id = f"range_{src_msg_id}_{msg_ids[0]}"
-
-                        if is_db:
-                            # DB 链接：获取消息检查类型
-                            db_visual_no_cap = []  # 视觉无 caption → 组相册
-                            for mid in msg_ids:
-                                try:
-                                    src = await client.get_messages(chat_id=CHANNEL_ID, message_ids=mid)
-                                    if not src or src.empty:
-                                        continue
-                                    is_visual = bool(src.photo or src.video)
-                                    has_cap = bool(src.caption)
-                                    if is_visual and not has_cap:
-                                        db_visual_no_cap.append(mid)
-                                    else:
-                                        # 有 caption 的媒体 / 非视觉 / 文本 → 独立
-                                        single_other_ids.append(mid)
-                                except Exception as e:
-                                    logger.warning(f"DB 范围消息获取失败 {mid}: {e}")
-                                    single_other_ids.append(mid)
-                            # 无 caption 的视觉媒体组相册
-                            if len(db_visual_no_cap) >= 2:
-                                range_groups.append((range_group_id, db_visual_no_cap))
-                            elif len(db_visual_no_cap) == 1:
-                                single_other_ids.append(db_visual_no_cap[0])
-                        else:
-                            # 外部链接：先批量获取源消息
-                            source_msgs = []
-                            for mid in msg_ids:
-                                try:
-                                    src = await client.get_messages(chat_id=channel_id, message_ids=mid)
-                                    if src and not src.empty:
-                                        source_msgs.append(src)
-                                except FloodWait as e:
-                                    await asyncio.sleep(e.value)
-                                    try:
-                                        src = await client.get_messages(chat_id=channel_id, message_ids=mid)
-                                        if src and not src.empty:
-                                            source_msgs.append(src)
-                                    except Exception:
-                                        pass
-                                except Exception as ex:
-                                    logger.warning(f"范围链接获取失败 {channel_id}/{mid}: {ex}")
-
-                            if not source_msgs:
-                                continue
-
-                            # 分离视觉和非视觉
-                            visual_srcs = [s for s in source_msgs if s.photo or s.video]
-                            other_srcs = [s for s in source_msgs if not (s.photo or s.video)]
-
-                            # 视觉媒体用 send_media_group 组相册（8取模）
-                            for vi in range(0, len(visual_srcs), 8):
-                                vbatch = visual_srcs[vi:vi+8]
-                                sub_group_id = f"{range_group_id}_{vi//8}" if len(visual_srcs) > 8 else range_group_id
-                                if len(vbatch) >= 2:
-                                    media_list = []
-                                    for vs in vbatch:
-                                        if vs.photo:
-                                            media_list.append(InputMediaPhoto(media=vs.photo.file_id, caption=vs.caption or ""))
-                                        elif vs.video:
-                                            media_list.append(InputMediaVideo(media=vs.video.file_id, caption=vs.caption or ""))
-                                    try:
-                                        posted = await client.send_media_group(
-                                            chat_id=CHANNEL_ID, media=media_list, disable_notification=True
-                                        )
-                                        range_groups.append((sub_group_id, [p.id for p in posted]))
-                                    except FloodWait as e:
-                                        await asyncio.sleep(e.value)
-                                        try:
-                                            posted = await client.send_media_group(
-                                                chat_id=CHANNEL_ID, media=media_list, disable_notification=True
-                                            )
-                                            range_groups.append((sub_group_id, [p.id for p in posted]))
-                                        except Exception as ex:
-                                            logger.warning(f"范围 send_media_group 失败: {ex}")
-                                    except Exception as e:
-                                        logger.warning(f"范围 send_media_group 失败: {e}")
-                                else:
-                                    # 单条视觉
-                                    try:
-                                        post = await vbatch[0].copy(chat_id=CHANNEL_ID, disable_notification=True)
-                                        range_groups.append((sub_group_id, [post.id]))
-                                    except Exception as e:
-                                        logger.warning(f"范围单条 copy 失败: {e}")
-
-                            # 非视觉逐条 copy
-                            for os_msg in other_srcs:
-                                try:
-                                    post = await os_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                                    single_other_ids.append(post.id)
-                                except Exception as e:
-                                    logger.warning(f"范围非视觉 copy 失败: {e}")
-                    else:
-                        # 单条链接：先解析源消息
-                        mid = msg_ids[0]
-                        try:
-                            if is_db:
-                                src = await client.get_messages(chat_id=CHANNEL_ID, message_ids=mid)
-                            else:
-                                src = await client.get_messages(chat_id=channel_id, message_ids=mid)
-
-                            if not src or src.empty:
-                                continue
-
-                            has_caption = bool(src.caption)
-                            is_visual = bool(src.photo or src.video)
-
-                            if is_visual and not has_caption:
-                                # 无 caption 的视觉媒体 → 收集后统一组相册
-                                single_visual_ids.append((src, channel_id, is_db))
-                            else:
-                                # 有 caption 的媒体 / 非视觉媒体 → 逐条处理
-                                if is_db:
-                                    single_other_ids.append(mid)
-                                else:
-                                    post = await src.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                                    single_other_ids.append(post.id)
-                        except FloodWait as e:
-                            await asyncio.sleep(e.value)
-                            try:
-                                if is_db:
-                                    single_other_ids.append(mid)
-                                else:
-                                    src = await client.get_messages(chat_id=channel_id, message_ids=mid)
-                                    if src and not src.empty:
-                                        post = await src.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                                        single_other_ids.append(post.id)
-                            except Exception:
-                                pass
-                        except Exception as ex:
-                            logger.warning(f"单条链接处理失败 {channel_id}/{mid}: {ex}")
-
-                # ===== 第二步：记录 PackItem =====
-
-                # 范围链接：自然分组记录
-                for group_id, db_ids in range_groups:
-                    for db_id in db_ids:
-                        session.items.append(PackItem(message_id=db_id, media_group_id=group_id))
-
-                # 单条视觉媒体（无 caption）：区分 DB 和外部，凑 8 取模组相册
-                # 先分开 DB 和外部
-                db_visuals = [(s, c, d) for s, c, d in single_visual_ids if d]
-                ext_visuals = [(s, c, d) for s, c, d in single_visual_ids if not d]
-
-                # DB 视觉：只记录 message_id + 共享 group_id（不重复入库）
-                if len(db_visuals) >= 2:
-                    album_group_id = f"dbsingles_{src_msg_id}"
-                    for src_msg, ch_id, _ in db_visuals:
-                        session.items.append(PackItem(message_id=src_msg.id, media_group_id=album_group_id))
-                elif len(db_visuals) == 1:
-                    session.items.append(PackItem(message_id=db_visuals[0][0].id))
-
-                # 外部视觉：凑 8 取模，send_media_group 组真正相册
-                for i in range(0, len(ext_visuals), 8):
-                    batch = ext_visuals[i:i+8]
-                    if len(batch) >= 2:
-                        media_list = []
-                        for src_msg, ch_id, _ in batch:
-                            if src_msg.photo:
-                                media_list.append(InputMediaPhoto(media=src_msg.photo.file_id))
-                            elif src_msg.video:
-                                media_list.append(InputMediaVideo(media=src_msg.video.file_id))
-
-                        album_group_id = f"singles_{src_msg_id}_{i//8}"
-                        try:
-                            posted_msgs = await client.send_media_group(
-                                chat_id=CHANNEL_ID, media=media_list, disable_notification=True
-                            )
-                            for pm in posted_msgs:
-                                session.items.append(PackItem(message_id=pm.id, media_group_id=album_group_id))
-                        except FloodWait as e:
-                            await asyncio.sleep(e.value)
-                            try:
-                                posted_msgs = await client.send_media_group(
-                                    chat_id=CHANNEL_ID, media=media_list, disable_notification=True
-                                )
-                                for pm in posted_msgs:
-                                    session.items.append(PackItem(message_id=pm.id, media_group_id=album_group_id))
-                            except Exception as ex:
-                                logger.warning(f"send_media_group 失败: {ex}")
-                        except Exception as e:
-                            logger.warning(f"send_media_group 失败: {e}")
-                    else:
-                        # 只有 1 条外部，直接 copy
-                        src_msg, ch_id, _ = batch[0]
-                        try:
-                            post = await src_msg.copy(chat_id=CHANNEL_ID, disable_notification=True)
-                            session.items.append(PackItem(message_id=post.id))
-                        except Exception as e:
-                            logger.warning(f"visual copy 失败: {e}")
-
-                # 单条非视觉：逐条记录
-                for db_id in single_other_ids:
-                    session.items.append(PackItem(message_id=db_id))
-
-                # caption 作为独立文本消息发到 DB
-                if caption_text:
-                    try:
-                        cap_msg = await client.send_message(
-                            chat_id=CHANNEL_ID, text=caption_text,
-                            disable_web_page_preview=False, disable_notification=True
-                        )
-                        session.items.append(PackItem(message_id=cap_msg.id))
-                    except Exception as e:
-                        logger.warning(f"caption 文本存入失败: {e}")
-
-        # 完成 Session
-        completed_session = await close_session(admin_id, cancelled=False)
-        item_count = len(completed_session.items)
-
-        # 生成分享链接
-        base64_string = await encode(f"pack-{completed_session.pack_id}")
-        link = f"https://t.me/{client.username}?start={base64_string}"
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📦 新建资源包", callback_data="store_new"),
-                InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}')
-            ],
-        ])
-
-        await query.message.edit_text(
-            f"🎉 <b>资源包已生成！</b>\n\n"
-            f"📊 已存入 <b>{item_count}</b> 项资源\n"
-            f"🔗 分享链接：\n<code>{link}</code>",
-            reply_markup=keyboard
-        )
-        await query.answer("✅ 打包完成！")
+        await query.answer("⏳ 开始处理...", show_alert=False)
+        await _finalize_session(client, session, query.message)
 
     elif data.startswith("store_cancel_"):
         pack_id = data[len("store_cancel_"):]
@@ -939,7 +985,7 @@ async def store_new_callback(client: Client, query: CallbackQuery):
     if get_session(admin_id):
         await close_session(admin_id, cancelled=True)
 
-    session = await start_session(admin_id)
+    session = await start_session(admin_id, client=client)
 
     welcome_text = (
         "📦 <b>新资源包已开启</b>\n\n"
@@ -949,7 +995,7 @@ async def store_new_callback(client: Client, query: CallbackQuery):
         "• 发送 TG 链接（支持范围如 100-110）\n"
         "• 一条消息可混合多条链接\n"
         "• 编辑已发消息可追加链接\n\n"
-        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭"
+        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭" if STORE_SESSION_TIMEOUT >= 60 else f"⏱ {STORE_SESSION_TIMEOUT} 秒无操作自动关闭"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ 取消", callback_data=f"store_cancel_{session.pack_id}")]

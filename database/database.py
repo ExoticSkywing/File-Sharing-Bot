@@ -33,9 +33,20 @@ def _ensure_tables():
                     pack_id    VARCHAR(16) PRIMARY KEY,
                     admin_id   BIGINT NOT NULL,
                     item_count INT DEFAULT 0,
+                    status     ENUM('active','done') DEFAULT 'active',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # 兼容旧表：如果 status 列不存在则添加，并将旧记录标记为已完成
+            try:
+                cur.execute("""
+                    ALTER TABLE resource_packs
+                    ADD COLUMN status ENUM('active','done') DEFAULT 'active'
+                """)
+                # 旧包在加列前就已完成，全部标记为 done
+                cur.execute("UPDATE resource_packs SET status = 'done' WHERE status = 'active'")
+            except Exception:
+                pass  # 列已存在
             # 资源包明细表
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS pack_items (
@@ -148,11 +159,60 @@ def get_pack_items(pack_id: str):
         conn.close()
 
 def pack_exists(pack_id: str) -> bool:
-    """检查资源包是否存在"""
+    """检查资源包是否存在且已完成"""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM resource_packs WHERE pack_id = %s", (pack_id,))
+            cur.execute("SELECT 1 FROM resource_packs WHERE pack_id = %s AND status = 'done'", (pack_id,))
             return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def finish_pack(pack_id: str, item_count: int):
+    """将资源包标记为完成"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE resource_packs SET status = 'done', item_count = %s WHERE pack_id = %s",
+                (item_count, pack_id)
+            )
+    finally:
+        conn.close()
+
+
+def delete_pack(pack_id: str):
+    """删除空资源包（取消时调用）"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM pack_items WHERE pack_id = %s", (pack_id,))
+            cur.execute("DELETE FROM resource_packs WHERE pack_id = %s", (pack_id,))
+    finally:
+        conn.close()
+
+
+def get_active_packs():
+    """获取所有未完成的资源包（Bot 重启恢复用）"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pack_id, admin_id, item_count FROM resource_packs WHERE status = 'active'"
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def get_pack_item_count(pack_id: str) -> int:
+    """获取资源包当前条目数"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM pack_items WHERE pack_id = %s", (pack_id,))
+            row = cur.fetchone()
+            return row[0] if row else 0
     finally:
         conn.close()

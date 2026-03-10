@@ -83,6 +83,62 @@ class Bot(Client):
 
         self.set_parse_mode(ParseMode.HTML)
         self.username = usr_bot_me.username
+
+        # ====== 恢复未完成的资源包 ======
+        try:
+            from database.database import get_active_packs, finish_pack, delete_pack, get_pack_item_count, get_pack_items
+            from plugins.store_session import StoreSession, PackItem, active_sessions, session_timeout_watcher
+            from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+            import asyncio as _asyncio
+
+            active_packs = get_active_packs()
+            if active_packs:
+                recovered = 0
+                deleted = 0
+                for pack_id, admin_id, _ in active_packs:
+                    item_count = get_pack_item_count(pack_id)
+                    if item_count > 0:
+                        # 有内容 → 重建活跃 Session，让管理员继续编辑
+                        db_items = get_pack_items(pack_id)
+                        items = [PackItem(message_id=row[0], media_group_id=row[1]) for row in db_items]
+
+                        session = StoreSession(
+                            admin_id=admin_id,
+                            pack_id=pack_id,
+                            client=self,
+                            items=items,
+                        )
+                        active_sessions[admin_id] = session
+                        session.timeout_task = _asyncio.create_task(session_timeout_watcher(admin_id))
+
+                        recovered += 1
+
+                        # 通知管理员：可以继续或直接完成
+                        try:
+                            keyboard = InlineKeyboardMarkup([
+                                [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{pack_id}")]
+                            ])
+                            status_msg = await self.send_message(
+                                chat_id=admin_id,
+                                text=f"🔄 <b>上次未完成的资源包已恢复</b>\n\n"
+                                     f"📦 已有 <b>{item_count}</b> 项资源\n"
+                                     f"📝 您可以继续发送资源，或点击下方完成打包",
+                                reply_markup=keyboard
+                            )
+                            session.status_message = status_msg
+                        except Exception:
+                            pass
+                    else:
+                        # 空包 → 删除
+                        delete_pack(pack_id)
+                        deleted += 1
+                if recovered > 0:
+                    self.LOGGER(__name__).info(f"🔄 已恢复 {recovered} 个未完成的资源包")
+                if deleted > 0:
+                    self.LOGGER(__name__).info(f"🗑 已清理 {deleted} 个空资源包")
+        except Exception as e:
+            self.LOGGER(__name__).warning(f"⚠️ 资源包恢复检查失败: {e}")
+
         self.LOGGER(__name__).info(f"🚀 小芽空投机已启动！Bot: @{self.username}")
 
         # Web 健康检查服务
