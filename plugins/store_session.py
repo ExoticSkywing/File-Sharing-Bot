@@ -949,11 +949,10 @@ async def store_new_callback(client: Client, query: CallbackQuery):
         "• 发送 TG 链接（支持范围如 100-110）\n"
         "• 一条消息可混合多条链接\n"
         "• 编辑已发消息可追加链接\n\n"
-        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭\n"
-        "完成后点击下方按钮 👇"
+        f"⏱ {STORE_SESSION_TIMEOUT // 60} 分钟无操作自动关闭"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ 完成打包", callback_data=f"store_done_{session.pack_id}")]
+        [InlineKeyboardButton("❌ 取消", callback_data=f"store_cancel_{session.pack_id}")]
     ])
 
     # 把原完成消息的按钮清掉，避免「新建资源包」按钮悬空
