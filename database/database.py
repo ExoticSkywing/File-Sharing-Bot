@@ -58,6 +58,32 @@ def _ensure_tables():
                     INDEX idx_pack (pack_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # 口令映射表
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pack_codes (
+                    id         INT AUTO_INCREMENT PRIMARY KEY,
+                    pack_id    VARCHAR(64) NOT NULL,
+                    code       VARCHAR(64) NOT NULL UNIQUE,
+                    code_type  ENUM('auto','custom') DEFAULT 'auto',
+                    is_active  TINYINT(1) DEFAULT 1,
+                    use_count  INT DEFAULT 0,
+                    max_uses   INT DEFAULT 0,
+                    expires_at TIMESTAMP NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_pack (pack_id),
+                    INDEX idx_active_code (is_active, code)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # 兼容：resource_packs 新增 name/tags/updated_at（忽略已存在错误）
+            for col_sql in [
+                "ALTER TABLE resource_packs ADD COLUMN name VARCHAR(255) DEFAULT NULL",
+                "ALTER TABLE resource_packs ADD COLUMN tags VARCHAR(512) DEFAULT NULL",
+                "ALTER TABLE resource_packs ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+            ]:
+                try:
+                    cur.execute(col_sql)
+                except Exception:
+                    pass
     finally:
         conn.close()
 
@@ -216,3 +242,87 @@ def get_pack_item_count(pack_id: str) -> int:
             return row[0] if row else 0
     finally:
         conn.close()
+
+
+# ==================== 口令管理 ====================
+
+def create_pack_code(pack_id: str, code: str, code_type: str = 'auto'):
+    """创建口令"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO pack_codes (pack_id, code, code_type) VALUES (%s, %s, %s)",
+                (pack_id, code, code_type)
+            )
+    finally:
+        conn.close()
+
+
+def lookup_code(code: str):
+    """查找口令对应的 pack_id（仅查有效且未过期的）"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pack_id, max_uses, use_count FROM pack_codes "
+                "WHERE code = %s AND is_active = 1 "
+                "AND (expires_at IS NULL OR expires_at > NOW())",
+                (code,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            pack_id, max_uses, use_count = row
+            if max_uses > 0 and use_count >= max_uses:
+                return None
+            return pack_id
+    finally:
+        conn.close()
+
+
+def increment_code_use(code: str):
+    """口令使用次数 +1"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pack_codes SET use_count = use_count + 1 WHERE code = %s",
+                (code,)
+            )
+    finally:
+        conn.close()
+
+
+# ==================== 身份绑定检查（跨库查询 tgbot_verify） ====================
+
+def _get_verify_conn():
+    """连接小芽精灵数据库（tgbot_verify）"""
+    import os
+    return pymysql.connect(
+        host=os.environ.get("VERIFY_DB_HOST", "localhost"),
+        port=int(os.environ.get("VERIFY_DB_PORT", "3306")),
+        user=os.environ.get("VERIFY_DB_USER", "xiaoyajl_bot"),
+        password=os.environ.get("VERIFY_DB_PASSWORD", "850163096"),
+        database=os.environ.get("VERIFY_DB_NAME", "xiaoyajl_bot"),
+        charset='utf8mb4',
+        autocommit=True,
+    )
+
+
+def check_tg_bindstatus(tg_user_id: int) -> bool:
+    """检查 TG 用户是否已绑定站点账号（wp_openid 非空）"""
+    try:
+        conn = _get_verify_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT wp_openid FROM users WHERE user_id = %s",
+                    (tg_user_id,)
+                )
+                row = cur.fetchone()
+                return bool(row and row[0])
+        finally:
+            conn.close()
+    except Exception:
+        return False

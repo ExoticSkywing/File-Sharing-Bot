@@ -19,7 +19,7 @@ from pyrogram.errors import FloodWait
 from bot import Bot
 from config import ADMINS, CHANNEL_ID, STORE_SESSION_TIMEOUT, STORE_ALBUM_WAIT
 from helper_func import encode
-from database.database import create_pack, add_pack_item, update_pack_count, finish_pack, delete_pack, get_active_packs, get_pack_item_count
+from database.database import create_pack, add_pack_item, update_pack_count, finish_pack, delete_pack, get_active_packs, get_pack_item_count, create_pack_code, check_tg_bindstatus
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +168,14 @@ def count_tg_links(links: list) -> int:
 def generate_pack_id() -> str:
     """生成 12 位随机 pack_id"""
     return secrets.token_urlsafe(9)  # 12 字符
+
+
+def generate_code() -> str:
+    """生成提货口令：XY- + 6位大写字母数字"""
+    import string
+    chars = string.ascii_uppercase + string.digits
+    suffix = ''.join(secrets.choice(chars) for _ in range(6))
+    return f"XY-{suffix}"
 
 async def start_session(admin_id: int, client: Client = None) -> StoreSession:
     """创建一个新的存储 Session"""
@@ -900,17 +908,48 @@ async def _finalize_session(client: Client, session: StoreSession, status_messag
     base64_string = await encode(f"pack-{completed_session.pack_id}")
     link = f"https://t.me/{client.username}?start={base64_string}"
 
+    # 自动生成提货口令
+    code = generate_code()
+    try:
+        create_pack_code(completed_session.pack_id, code, 'auto')
+    except Exception as e:
+        logger.warning(f"口令生成失败，重试: {e}")
+        code = generate_code()
+        try:
+            create_pack_code(completed_session.pack_id, code, 'auto')
+        except Exception:
+            code = None
+
+    # 检查管理员是否已绑定站点账号，决定按钮行为
+    is_bound = check_tg_bindstatus(admin_id)
+    if is_bound:
+        manage_btn = InlineKeyboardButton(
+            "◆ 管理我的空投包 ↗",
+            url="https://center.manyuzo.com/api/auth/wp-login?redirect=%2Fairdrop%2Fpacks",
+        )
+    else:
+        manage_btn = InlineKeyboardButton(
+            "🔗 先绑定站点账号 ↗",
+            url="https://t.me/moemoji_bot?start=bindguide",
+        )
+
     keyboard = InlineKeyboardMarkup([
         [
+            InlineKeyboardButton("📋 复制链接", callback_data=f"copy_link_{completed_session.pack_id}"),
+            InlineKeyboardButton("📋 复制口令", callback_data=f"copy_code_{completed_session.pack_id}"),
+        ],
+        [
             InlineKeyboardButton("📦 新建资源包", callback_data="store_new"),
-            InlineKeyboardButton("🔁 分享链接", url=f'https://telegram.me/share/url?url={link}')
+            manage_btn,
         ],
     ])
 
+    code_line = f"\n🔑 提货口令：<code>{code}</code>" if code else ""
     result_text = (
         f"🎉 <b>资源包已生成！</b>\n\n"
         f"📊 已存入 <b>{item_count}</b> 项资源\n"
         f"🔗 分享链接：\n<code>{link}</code>"
+        f"{code_line}"
     )
 
     if status_message:
@@ -1014,3 +1053,33 @@ async def store_new_callback(client: Client, query: CallbackQuery):
     )
     session.status_message = status_msg
     await query.answer("📦 新资源包已开启！")
+
+
+@Bot.on_callback_query(filters.regex(r'^copy_(link|code)_') & filters.user(ADMINS))
+async def copy_callback(client: Client, query: CallbackQuery):
+    """复制链接/口令按钮 — 通过 answer 弹窗显示内容供用户复制"""
+    data = query.data
+
+    if data.startswith("copy_link_"):
+        pack_id = data[len("copy_link_"):]
+        base64_string = await encode(f"pack-{pack_id}")
+        link = f"https://t.me/{client.username}?start={base64_string}"
+        await query.answer(f"🔗 {link}", show_alert=True)
+
+    elif data.startswith("copy_code_"):
+        pack_id = data[len("copy_code_"):]
+        from database.database import _get_conn
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT code FROM pack_codes WHERE pack_id = %s AND code_type = 'auto' LIMIT 1",
+                    (pack_id,)
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row:
+            await query.answer(f"🔑 {row[0]}", show_alert=True)
+        else:
+            await query.answer("⚠️ 该资源包暂无口令", show_alert=True)
