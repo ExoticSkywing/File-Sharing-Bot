@@ -626,12 +626,12 @@ async def session_message_handler(client: Client, message: Message):
     # 有相册标识 → 走相册缓冲逻辑
     if message.media_group_id:
         await process_album_message(client, message, session)
-        return
+        message.stop_propagation()
 
     # 有媒体文件（非相册的单条）
     if _has_media(message):
         await process_media_message(client, message, session)
-        return
+        message.stop_propagation()
 
     # 纯文本消息（含/不含链接）→ 统一暂存
     if message.text:
@@ -925,12 +925,12 @@ async def _finalize_session(client: Client, session: StoreSession, status_messag
     if is_bound:
         manage_btn = InlineKeyboardButton(
             "◆ 管理我的空投包 ↗",
-            url="https://center.manyuzo.com/api/auth/wp-login?redirect=%2Fairdrop%2Fpacks",
+            url="https://center.manyuzo.com/airdrop/packs",
         )
     else:
         manage_btn = InlineKeyboardButton(
-            "🔗 先绑定站点账号 ↗",
-            url="https://t.me/moemoji_bot?start=bindguide",
+            "◆ 管理空投包",
+            callback_data="bind_guide",
         )
 
     keyboard = InlineKeyboardMarkup([
@@ -1053,6 +1053,35 @@ async def store_new_callback(client: Client, query: CallbackQuery):
     )
     session.status_message = status_msg
     await query.answer("📦 新资源包已开启！")
+
+
+@Bot.on_callback_query(filters.regex(r'^bind_guide$') & filters.user(ADMINS))
+async def bind_guide_callback(client: Client, query: CallbackQuery):
+    """未绑定时点「管理空投包」→ 弹窗解释 + 替换按钮为绑定链接"""
+    await query.answer(
+        "⚠️ 需要先绑定星小芽站点账号\n\n"
+        "绑定后即可在网页端管理空投包、编辑口令、查看数据\n\n"
+        "点击「确定」后，请点击下方「前往绑定」按钮 👇",
+        show_alert=True,
+    )
+    # 弹窗关闭后，把当前按钮行替换为绑定链接
+    try:
+        old_kb = query.message.reply_markup.inline_keyboard
+        new_rows = []
+        for row in old_kb:
+            new_row = []
+            for btn in row:
+                if btn.callback_data == "bind_guide":
+                    new_row.append(InlineKeyboardButton(
+                        "🔗 前往绑定 ↗",
+                        url="https://t.me/moemoji_bot?start=bind",
+                    ))
+                else:
+                    new_row.append(btn)
+            new_rows.append(new_row)
+        await query.message.edit_reply_markup(InlineKeyboardMarkup(new_rows))
+    except Exception:
+        pass
 
 
 @Bot.on_callback_query(filters.regex(r'^copy_(link|code)_') & filters.user(ADMINS))

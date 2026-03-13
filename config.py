@@ -65,6 +65,10 @@ AUTO_DEL_SUCCESS_MSG = os.environ.get("AUTO_DEL_SUCCESS_MSG", "💨 文件已自
 # 是否禁用频道帖子的分享按钮
 DISABLE_CHANNEL_BUTTON = os.environ.get("DISABLE_CHANNEL_BUTTON", True) == 'True'
 
+# 精灵内部 API（TG 侧身份权威，查绑定状态）
+VERIFY_API_BASE = os.environ.get("VERIFY_API_BASE", "https://xyjl.1yo.cc")
+VERIFY_API_KEY = os.environ.get("VERIFY_API_KEY", "07fe3ff58981bfb2bffcb164f002f514afea1abe7b114047")
+
 # 存储 Session 配置
 STORE_SESSION_TIMEOUT = int(os.getenv("STORE_SESSION_TIMEOUT", "50"))  # 10分钟无操作自动关闭
 STORE_ALBUM_WAIT = float(os.getenv("STORE_ALBUM_WAIT", "0.5"))         # 相册消息合并等待秒数

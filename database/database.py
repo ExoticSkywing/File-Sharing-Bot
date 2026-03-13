@@ -294,35 +294,26 @@ def increment_code_use(code: str):
         conn.close()
 
 
-# ==================== 身份绑定检查（查 WP usermeta _xingxy_telegram_uid） ====================
-
-def _get_wp_conn():
-    """连接星小芽 WordPress 数据库"""
-    import os
-    return pymysql.connect(
-        host=os.environ.get("WP_DB_HOST", "localhost"),
-        port=int(os.environ.get("WP_DB_PORT", "3306")),
-        user=os.environ.get("WP_DB_USER", "xingxy_manyuzo"),
-        password=os.environ.get("WP_DB_PASSWORD", "xingxymanyuzo_8501"),
-        database=os.environ.get("WP_DB_NAME", "xingxy_manyuzo"),
-        charset='utf8mb4',
-        autocommit=True,
-    )
-
+# ==================== 身份绑定检查（通过精灵内部 API） ====================
 
 def check_tg_bindstatus(tg_user_id: int) -> bool:
-    """检查 TG 用户是否已绑定站点账号（WP usermeta 中有 _xingxy_telegram_uid 记录）"""
+    """检查 TG 用户是否已绑定站点账号（调用精灵 /api/check-bind 端点）"""
+    import hashlib
+    import requests
+    from config import VERIFY_API_BASE, VERIFY_API_KEY
+
+    if not VERIFY_API_KEY:
+        return False
     try:
-        conn = _get_wp_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT umeta_id FROM wp_usermeta "
-                    "WHERE meta_key = '_xingxy_telegram_uid' AND meta_value = %s LIMIT 1",
-                    (str(tg_user_id),)
-                )
-                return cur.fetchone() is not None
-        finally:
-            conn.close()
+        tg_uid_str = str(tg_user_id)
+        sign = hashlib.md5((tg_uid_str + VERIFY_API_KEY).encode()).hexdigest()
+        resp = requests.get(
+            f"{VERIFY_API_BASE}/api/check-bind",
+            params={"tg_uid": tg_uid_str, "sign": sign},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("bound", False)
+        return False
     except Exception:
         return False
