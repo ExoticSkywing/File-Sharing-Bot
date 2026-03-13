@@ -294,34 +294,34 @@ def increment_code_use(code: str):
         conn.close()
 
 
-# ==================== 身份绑定检查（跨库查询 tgbot_verify） ====================
+# ==================== 身份绑定检查（查 WP usermeta _xingxy_telegram_uid） ====================
 
-def _get_verify_conn():
-    """连接小芽精灵数据库（tgbot_verify）"""
+def _get_wp_conn():
+    """连接星小芽 WordPress 数据库"""
     import os
     return pymysql.connect(
-        host=os.environ.get("VERIFY_DB_HOST", "localhost"),
-        port=int(os.environ.get("VERIFY_DB_PORT", "3306")),
-        user=os.environ.get("VERIFY_DB_USER", "xiaoyajl_bot"),
-        password=os.environ.get("VERIFY_DB_PASSWORD", "850163096"),
-        database=os.environ.get("VERIFY_DB_NAME", "xiaoyajl_bot"),
+        host=os.environ.get("WP_DB_HOST", "localhost"),
+        port=int(os.environ.get("WP_DB_PORT", "3306")),
+        user=os.environ.get("WP_DB_USER", "xingxy_manyuzo"),
+        password=os.environ.get("WP_DB_PASSWORD", "xingxymanyuzo_8501"),
+        database=os.environ.get("WP_DB_NAME", "xingxy_manyuzo"),
         charset='utf8mb4',
         autocommit=True,
     )
 
 
 def check_tg_bindstatus(tg_user_id: int) -> bool:
-    """检查 TG 用户是否已绑定站点账号（wp_openid 非空）"""
+    """检查 TG 用户是否已绑定站点账号（WP usermeta 中有 _xingxy_telegram_uid 记录）"""
     try:
-        conn = _get_verify_conn()
+        conn = _get_wp_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT wp_openid FROM users WHERE user_id = %s",
-                    (tg_user_id,)
+                    "SELECT umeta_id FROM wp_usermeta "
+                    "WHERE meta_key = '_xingxy_telegram_uid' AND meta_value = %s LIMIT 1",
+                    (str(tg_user_id),)
                 )
-                row = cur.fetchone()
-                return bool(row and row[0])
+                return cur.fetchone() is not None
         finally:
             conn.close()
     except Exception:
