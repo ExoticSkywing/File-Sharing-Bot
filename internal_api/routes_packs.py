@@ -72,6 +72,13 @@ class PackUpdateBody(BaseModel):
     is_super: bool = False
     name: Optional[str] = None
     tags: Optional[str] = None
+    protect_content: Optional[str] = None  # "true" | "false" | "inherit" | None(不改)
+
+
+class SettingsUpdateBody(BaseModel):
+    tg_uid: int
+    is_super: bool = False
+    protect_content: Optional[bool] = None
 
 
 class PackDeleteParams(BaseModel):
@@ -173,7 +180,7 @@ async def list_packs(
             cur.execute(
                 f"""
                 SELECT rp.pack_id, rp.admin_id, rp.item_count, rp.name, rp.tags,
-                       rp.created_at, rp.updated_at, rp.deleted_at
+                       rp.created_at, rp.updated_at, rp.deleted_at, rp.protect_content
                 FROM resource_packs rp
                 WHERE {where_clause}
                 ORDER BY rp.created_at DESC
@@ -213,6 +220,7 @@ async def list_packs(
                     "item_count": p["item_count"],
                     "name": p["name"],
                     "tags": p["tags"],
+                    "protect_content": None if p["protect_content"] is None else bool(p["protect_content"]),
                     "created_at": str(p["created_at"]) if p["created_at"] else None,
                     "updated_at": str(p["updated_at"]) if p["updated_at"] else None,
                     "deleted_at": str(p["deleted_at"]) if p["deleted_at"] else None,
@@ -277,6 +285,7 @@ async def get_pack_detail(
                     "item_count": item_count,
                     "name": pack["name"],
                     "tags": pack["tags"],
+                    "protect_content": None if pack.get("protect_content") is None else bool(pack["protect_content"]),
                     "created_at": str(pack["created_at"]) if pack["created_at"] else None,
                     "updated_at": str(pack["updated_at"]) if pack["updated_at"] else None,
                     "share_link": f"https://t.me/{bot_username}?start={b64}",
@@ -327,6 +336,12 @@ async def update_pack(
                 updates.append("tags = %s")
                 # 去除标签首尾空格，避免匹配问题
                 params.append(body.tags.strip() if body.tags else body.tags)
+            if body.protect_content is not None:
+                if body.protect_content == "inherit":
+                    updates.append("protect_content = NULL")
+                else:
+                    updates.append("protect_content = %s")
+                    params.append(1 if body.protect_content == "true" else 0)
 
             if not updates:
                 return {"code": 0, "message": "无需更新"}
@@ -624,5 +639,58 @@ async def update_code(
                 )
 
             return {"code": 0, "message": "更新成功"}
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════
+# 全局设置
+# ═══════════════════════════════════════════════════
+
+@router.get("/api/settings")
+async def get_settings(
+    tg_uid: int = Query(...),
+    x_sign: str = Header(..., alias="X-Sign"),
+):
+    verify_sign(tg_uid, x_sign, INTERNAL_API_KEY)
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT setting_key, setting_value FROM bot_settings")
+            rows = cur.fetchall()
+            settings = {r["setting_key"]: r["setting_value"] for r in rows}
+            return {
+                "code": 0,
+                "data": {
+                    "protect_content": settings.get("protect_content", "true").lower() == "true",
+                },
+                "message": "ok",
+            }
+    finally:
+        conn.close()
+
+
+@router.put("/api/settings")
+async def update_settings(
+    body: SettingsUpdateBody,
+    x_sign: str = Header(..., alias="X-Sign"),
+):
+    verify_sign(body.tg_uid, x_sign, INTERNAL_API_KEY)
+
+    if not body.is_super:
+        raise HTTPException(status_code=403, detail="仅超级管理员可修改全局设置")
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            if body.protect_content is not None:
+                val = "true" if body.protect_content else "false"
+                cur.execute(
+                    "INSERT INTO bot_settings (setting_key, setting_value) VALUES ('protect_content', %s) "
+                    "ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+                    (val,),
+                )
+            return {"code": 0, "message": "设置已更新"}
     finally:
         conn.close()

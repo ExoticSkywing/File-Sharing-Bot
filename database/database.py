@@ -74,13 +74,26 @@ def _ensure_tables():
                     INDEX idx_active_code (is_active, code)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
-            # 兼容：resource_packs 新增 name/tags/updated_at/deleted_at（忽略已存在错误）
+            # 全局配置表
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    setting_key   VARCHAR(64) PRIMARY KEY,
+                    setting_value VARCHAR(255) NOT NULL,
+                    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # 初始化默认全局设置
+            cur.execute(
+                "INSERT IGNORE INTO bot_settings (setting_key, setting_value) VALUES ('protect_content', 'true')"
+            )
+            # 兼容：resource_packs 新增列（忽略已存在错误）
             for col_sql in [
                 "ALTER TABLE resource_packs ADD COLUMN name VARCHAR(255) DEFAULT NULL",
                 "ALTER TABLE resource_packs ADD COLUMN tags VARCHAR(512) DEFAULT NULL",
                 "ALTER TABLE resource_packs ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
                 "ALTER TABLE resource_packs ADD COLUMN deleted_at DATETIME DEFAULT NULL",
                 "ALTER TABLE resource_packs ADD INDEX idx_deleted (deleted_at)",
+                "ALTER TABLE resource_packs ADD COLUMN protect_content BOOLEAN DEFAULT NULL",
             ]:
                 try:
                     cur.execute(col_sql)
@@ -294,6 +307,52 @@ def increment_code_use(code: str):
                 "UPDATE pack_codes SET use_count = use_count + 1 WHERE code = %s",
                 (code,)
             )
+    finally:
+        conn.close()
+
+
+# ==================== 全局配置 ====================
+
+def get_setting(key: str, default: str = '') -> str:
+    """获取全局配置值"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT setting_value FROM bot_settings WHERE setting_key = %s", (key,))
+            row = cur.fetchone()
+            return row[0] if row else default
+    finally:
+        conn.close()
+
+
+def set_setting(key: str, value: str):
+    """设置全局配置值"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_settings (setting_key, setting_value) VALUES (%s, %s) "
+                "ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+                (key, value)
+            )
+    finally:
+        conn.close()
+
+
+def get_pack_protect_content(pack_id: str) -> bool:
+    """获取空投包最终生效的 protect_content 值（包级优先 > 全局默认）"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT protect_content FROM resource_packs WHERE pack_id = %s",
+                (pack_id,)
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return bool(row[0])
+            # 包级未设置，读取全局
+            return get_setting('protect_content', 'true').lower() == 'true'
     finally:
         conn.close()
 

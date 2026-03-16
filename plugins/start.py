@@ -15,7 +15,7 @@ from config import (
     JOIN_REQUEST_ENABLE, FORCE_SUB_CHANNEL, CHANNEL_ID
 )
 from helper_func import subscribed, decode, get_messages, delete_file
-from database.database import add_user, del_user, full_userbase, present_user, get_pack_items, pack_exists
+from database.database import add_user, del_user, full_userbase, present_user, get_pack_items, pack_exists, get_pack_protect_content
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,9 @@ async def _deliver_pack(client: Client, message: Message, pack_id: str):
     if not items:
         await message.reply_text("❌ 资源包不存在或已过期")
         return
+
+    # 包级优先 > 全局默认
+    pack_protect = get_pack_protect_content(pack_id)
 
     total = len(items)
     temp_msg = await message.reply(f"✨ 资源正在空投中，共 {total} 条，请稍候...")
@@ -94,7 +97,7 @@ async def _deliver_pack(client: Client, message: Message, pack_id: str):
                         try:
                             copied = await amsg.copy(
                                 chat_id=message.from_user.id,
-                                protect_content=PROTECT_CONTENT
+                                protect_content=pack_protect
                             )
                             if copied and AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
                                 track_msgs.append(copied)
@@ -108,7 +111,7 @@ async def _deliver_pack(client: Client, message: Message, pack_id: str):
                     sent_group = await client.send_media_group(
                         chat_id=message.from_user.id,
                         media=batch,
-                        protect_content=PROTECT_CONTENT
+                        protect_content=pack_protect
                     )
                     track_msgs.extend(sent_group)
                     sent += len(sent_group)
@@ -122,12 +125,12 @@ async def _deliver_pack(client: Client, message: Message, pack_id: str):
             except Exception as e:
                 logger.warning(f"相册推送失败，降级为逐条推送: {e}")
                 for mid in album_msg_ids:
-                    await _send_single(client, message, mid, track_msgs)
+                    await _send_single(client, message, mid, track_msgs, pack_protect)
                     sent += 1
 
         else:
             # 单条消息
-            await _send_single(client, message, key_id, track_msgs)
+            await _send_single(client, message, key_id, track_msgs, pack_protect)
             sent += 1
             if total > 3 and sent % 3 == 0:
                 try:
@@ -146,8 +149,10 @@ async def _deliver_pack(client: Client, message: Message, pack_id: str):
         asyncio.create_task(delete_file(track_msgs, client, delete_data))
 
 
-async def _send_single(client, message, msg_id, track_msgs):
+async def _send_single(client, message, msg_id, track_msgs, protect_content=None):
     """发送单条消息（从 DB 频道 copy 到用户）"""
+    if protect_content is None:
+        protect_content = PROTECT_CONTENT
     try:
         msgs = await get_messages(client, [msg_id])
         if not msgs:
@@ -162,13 +167,13 @@ async def _send_single(client, message, msg_id, track_msgs):
             caption=caption,
             parse_mode=ParseMode.HTML,
             reply_markup=reply_markup,
-            protect_content=PROTECT_CONTENT
+            protect_content=protect_content
         )
         if copied and AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
             track_msgs.append(copied)
     except FloodWait as e:
         await asyncio.sleep(e.value)
-        await _send_single(client, message, msg_id, track_msgs)
+        await _send_single(client, message, msg_id, track_msgs, protect_content)
     except Exception as e:
         logger.warning(f"发送消息 {msg_id} 失败: {e}")
 
