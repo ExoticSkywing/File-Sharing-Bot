@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PackItem:
-    """资源包中的一个条目"""
+    """空投包中的一个条目"""
     message_id: int           # DB 频道中的消息 ID
     media_group_id: str = None  # 相册分组 ID（可选）
 
@@ -186,7 +186,7 @@ async def start_session(admin_id: int, client: Client = None) -> StoreSession:
     pack_id = generate_pack_id()
     session = StoreSession(admin_id=admin_id, pack_id=pack_id, client=client)
 
-    # 数据库创建资源包记录
+    # 数据库创建空投包记录
     create_pack(pack_id, admin_id)
 
     active_sessions[admin_id] = session
@@ -935,18 +935,14 @@ async def _finalize_session(client: Client, session: StoreSession, status_messag
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📋 复制链接", callback_data=f"copy_link_{completed_session.pack_id}"),
-            InlineKeyboardButton("📋 复制口令", callback_data=f"copy_code_{completed_session.pack_id}"),
-        ],
-        [
-            InlineKeyboardButton("📦 新建资源包", callback_data="store_new"),
+            InlineKeyboardButton(" 新建空投包", callback_data="store_new"),
             manage_btn,
         ],
     ])
 
     code_line = f"\n🔑 提货口令：<code>{code}</code>" if code else ""
     result_text = (
-        f"🎉 <b>资源包已生成！</b>\n\n"
+        f"🎉 <b>空投包已生成！</b>\n\n"
         f"📊 已存入 <b>{item_count}</b> 项资源\n"
         f"🔗 分享链接：\n<code>{link}</code>"
         f"{code_line}"
@@ -1017,7 +1013,7 @@ async def store_callback(client: Client, query: CallbackQuery):
 
 @Bot.on_callback_query(filters.regex(r'^store_new$') & filters.user(ADMINS))
 async def store_new_callback(client: Client, query: CallbackQuery):
-    """点击「新建资源包」直接开启下一个 Session"""
+    """点击「新建空投包」直接开启下一个 Session"""
     admin_id = query.from_user.id
 
     # 如有旧 Session 先关闭
@@ -1027,7 +1023,7 @@ async def store_new_callback(client: Client, query: CallbackQuery):
     session = await start_session(admin_id, client=client)
 
     welcome_text = (
-        "📦 <b>新资源包已开启</b>\n\n"
+        "📦 <b>新空投包已开启</b>\n\n"
         "请发送资源，支持以下方式：\n"
         "• 直接发送 文件/图片/视频/相册\n"
         "• 转发消息/相册\n"
@@ -1040,7 +1036,7 @@ async def store_new_callback(client: Client, query: CallbackQuery):
         [InlineKeyboardButton("❌ 取消", callback_data=f"store_cancel_{session.pack_id}")]
     ])
 
-    # 把原完成消息的按钮清掉，避免「新建资源包」按钮悬空
+    # 把原完成消息的按钮清掉，避免「新建空投包」按钮悬空
     try:
         await query.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -1052,7 +1048,7 @@ async def store_new_callback(client: Client, query: CallbackQuery):
         reply_markup=keyboard
     )
     session.status_message = status_msg
-    await query.answer("📦 新资源包已开启！")
+    await query.answer("📦 新空投包已开启！")
 
 
 @Bot.on_callback_query(filters.regex(r'^bind_guide$') & filters.user(ADMINS))
@@ -1111,4 +1107,4 @@ async def copy_callback(client: Client, query: CallbackQuery):
         if row:
             await query.answer(f"🔑 {row[0]}", show_alert=True)
         else:
-            await query.answer("⚠️ 该资源包暂无口令", show_alert=True)
+            await query.answer("⚠️ 该空投包暂无口令", show_alert=True)
