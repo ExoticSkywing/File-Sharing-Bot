@@ -74,11 +74,13 @@ def _ensure_tables():
                     INDEX idx_active_code (is_active, code)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
-            # 兼容：resource_packs 新增 name/tags/updated_at（忽略已存在错误）
+            # 兼容：resource_packs 新增 name/tags/updated_at/deleted_at（忽略已存在错误）
             for col_sql in [
                 "ALTER TABLE resource_packs ADD COLUMN name VARCHAR(255) DEFAULT NULL",
                 "ALTER TABLE resource_packs ADD COLUMN tags VARCHAR(512) DEFAULT NULL",
                 "ALTER TABLE resource_packs ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+                "ALTER TABLE resource_packs ADD COLUMN deleted_at DATETIME DEFAULT NULL",
+                "ALTER TABLE resource_packs ADD INDEX idx_deleted (deleted_at)",
             ]:
                 try:
                     cur.execute(col_sql)
@@ -185,11 +187,11 @@ def get_pack_items(pack_id: str):
         conn.close()
 
 def pack_exists(pack_id: str) -> bool:
-    """检查资源包是否存在且已完成"""
+    """检查资源包是否存在且已完成（排除已删除）"""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM resource_packs WHERE pack_id = %s AND status = 'done'", (pack_id,))
+            cur.execute("SELECT 1 FROM resource_packs WHERE pack_id = %s AND status = 'done' AND deleted_at IS NULL", (pack_id,))
             return cur.fetchone() is not None
     finally:
         conn.close()
@@ -260,14 +262,16 @@ def create_pack_code(pack_id: str, code: str, code_type: str = 'auto'):
 
 
 def lookup_code(code: str):
-    """查找口令对应的 pack_id（仅查有效且未过期的）"""
+    """查找口令对应的 pack_id（仅查有效且未过期的，排除已删除包）"""
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT pack_id, max_uses, use_count FROM pack_codes "
-                "WHERE code = %s AND is_active = 1 "
-                "AND (expires_at IS NULL OR expires_at > NOW())",
+                "SELECT pc.pack_id, pc.max_uses, pc.use_count FROM pack_codes pc "
+                "JOIN resource_packs rp ON pc.pack_id = rp.pack_id "
+                "WHERE pc.code = %s AND pc.is_active = 1 "
+                "AND (pc.expires_at IS NULL OR pc.expires_at > NOW()) "
+                "AND rp.deleted_at IS NULL",
                 (code,)
             )
             row = cur.fetchone()

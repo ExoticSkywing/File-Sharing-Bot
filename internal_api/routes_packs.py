@@ -7,13 +7,13 @@ import base64
 import logging
 import httpx
 import pymysql
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Header, Query
 from pydantic import BaseModel
 from config import (
     MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE,
-    TG_BOT_TOKEN, INTERNAL_API_KEY,
+    TG_BOT_TOKEN, INTERNAL_API_KEY, CHANNEL_ID,
 )
 from auth import verify_sign
 
@@ -93,6 +93,13 @@ class CodeUpdateBody(BaseModel):
     is_active: Optional[bool] = None
 
 
+class BatchPacksBody(BaseModel):
+    tg_uid: int
+    is_super: bool = False
+    pack_ids: List[str]
+    clean_channel: bool = False
+
+
 # ═══════════════════════════════════════════════════
 # 端点
 # ═══════════════════════════════════════════════════
@@ -106,6 +113,7 @@ async def list_packs(
     group_id: int = Query(0),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    deleted: bool = Query(False),
     x_sign: str = Header(..., alias="X-Sign"),
 ):
     verify_sign(tg_uid, x_sign, INTERNAL_API_KEY)
@@ -115,6 +123,11 @@ async def list_packs(
         with conn.cursor() as cur:
             conditions = ["rp.status = 'done'"]
             params = []
+
+            if deleted:
+                conditions.append("rp.deleted_at IS NOT NULL")
+            else:
+                conditions.append("rp.deleted_at IS NULL")
 
             if not is_super:
                 conditions.append("rp.admin_id = %s")
@@ -160,7 +173,7 @@ async def list_packs(
             cur.execute(
                 f"""
                 SELECT rp.pack_id, rp.admin_id, rp.item_count, rp.name, rp.tags,
-                       rp.created_at, rp.updated_at
+                       rp.created_at, rp.updated_at, rp.deleted_at
                 FROM resource_packs rp
                 WHERE {where_clause}
                 ORDER BY rp.created_at DESC
@@ -202,6 +215,7 @@ async def list_packs(
                     "tags": p["tags"],
                     "created_at": str(p["created_at"]) if p["created_at"] else None,
                     "updated_at": str(p["updated_at"]) if p["updated_at"] else None,
+                    "deleted_at": str(p["deleted_at"]) if p["deleted_at"] else None,
                     "share_link": f"https://t.me/{bot_username}?start={b64}",
                     "auto_code": auto_code,
                     "codes": codes,
@@ -334,23 +348,177 @@ async def delete_pack(
     is_super: bool = Query(False),
     x_sign: str = Header(..., alias="X-Sign"),
 ):
+    """逻辑删除：移入回收站"""
     verify_sign(tg_uid, x_sign, INTERNAL_API_KEY)
 
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT admin_id FROM resource_packs WHERE pack_id = %s", (pack_id,))
+            cur.execute("SELECT admin_id, deleted_at FROM resource_packs WHERE pack_id = %s", (pack_id,))
             pack = cur.fetchone()
             if not pack:
                 raise HTTPException(status_code=404, detail="空投包不存在")
+            if pack["deleted_at"] is not None:
+                return {"code": 0, "message": "已在回收站中"}
             if not is_super and pack["admin_id"] != tg_uid:
                 raise HTTPException(status_code=403, detail="无权删除")
 
-            cur.execute("DELETE FROM pack_codes WHERE pack_id = %s", (pack_id,))
-            cur.execute("DELETE FROM pack_items WHERE pack_id = %s", (pack_id,))
-            cur.execute("DELETE FROM resource_packs WHERE pack_id = %s", (pack_id,))
+            cur.execute(
+                "UPDATE resource_packs SET deleted_at = NOW() WHERE pack_id = %s",
+                (pack_id,),
+            )
 
-            return {"code": 0, "message": "删除成功"}
+            return {"code": 0, "message": "已移入回收站"}
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════
+# 批量操作端点
+# ═══════════════════════════════════════════════════
+
+@router.post("/api/packs/batch-delete")
+async def batch_delete(
+    body: BatchPacksBody,
+    x_sign: str = Header(..., alias="X-Sign"),
+):
+    """批量逻辑删除：移入回收站"""
+    verify_sign(body.tg_uid, x_sign, INTERNAL_API_KEY)
+    if not body.pack_ids:
+        return {"code": 0, "message": "无需操作", "data": {"affected": 0}}
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(body.pack_ids))
+            if body.is_super:
+                cur.execute(
+                    f"UPDATE resource_packs SET deleted_at = NOW() "
+                    f"WHERE pack_id IN ({placeholders}) AND deleted_at IS NULL",
+                    body.pack_ids,
+                )
+            else:
+                cur.execute(
+                    f"UPDATE resource_packs SET deleted_at = NOW() "
+                    f"WHERE pack_id IN ({placeholders}) AND deleted_at IS NULL AND admin_id = %s",
+                    body.pack_ids + [body.tg_uid],
+                )
+            affected = cur.rowcount
+            return {"code": 0, "message": f"已移入回收站 {affected} 个", "data": {"affected": affected}}
+    finally:
+        conn.close()
+
+
+@router.post("/api/packs/batch-restore")
+async def batch_restore(
+    body: BatchPacksBody,
+    x_sign: str = Header(..., alias="X-Sign"),
+):
+    """批量恢复：从回收站移出"""
+    verify_sign(body.tg_uid, x_sign, INTERNAL_API_KEY)
+    if not body.pack_ids:
+        return {"code": 0, "message": "无需操作", "data": {"affected": 0}}
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(body.pack_ids))
+            if body.is_super:
+                cur.execute(
+                    f"UPDATE resource_packs SET deleted_at = NULL "
+                    f"WHERE pack_id IN ({placeholders}) AND deleted_at IS NOT NULL",
+                    body.pack_ids,
+                )
+            else:
+                cur.execute(
+                    f"UPDATE resource_packs SET deleted_at = NULL "
+                    f"WHERE pack_id IN ({placeholders}) AND deleted_at IS NOT NULL AND admin_id = %s",
+                    body.pack_ids + [body.tg_uid],
+                )
+            affected = cur.rowcount
+            return {"code": 0, "message": f"已恢复 {affected} 个", "data": {"affected": affected}}
+    finally:
+        conn.close()
+
+
+async def _delete_channel_messages(message_ids: List[int]):
+    """调用 TG Bot API 删除频道中的消息"""
+    if not message_ids or not TG_BOT_TOKEN or not CHANNEL_ID:
+        return 0
+    deleted = 0
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # TG deleteMessages 单次最多 100 条
+        for i in range(0, len(message_ids), 100):
+            batch = message_ids[i:i + 100]
+            try:
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{TG_BOT_TOKEN}/deleteMessages",
+                    json={"chat_id": CHANNEL_ID, "message_ids": batch},
+                )
+                data = resp.json()
+                if data.get("ok"):
+                    deleted += len(batch)
+                else:
+                    logger.warning(f"删除频道消息失败: {data}")
+            except Exception as e:
+                logger.warning(f"删除频道消息异常: {e}")
+    return deleted
+
+
+@router.post("/api/packs/batch-purge")
+async def batch_purge(
+    body: BatchPacksBody,
+    x_sign: str = Header(..., alias="X-Sign"),
+):
+    """彻底删除：物理删除 DB 记录，可选清理 TG 频道消息"""
+    verify_sign(body.tg_uid, x_sign, INTERNAL_API_KEY)
+    if not body.pack_ids:
+        return {"code": 0, "message": "无需操作", "data": {"affected": 0, "channel_deleted": 0}}
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(body.pack_ids))
+
+            # 权限检查：非超管只能删自己的
+            if body.is_super:
+                cur.execute(
+                    f"SELECT pack_id FROM resource_packs WHERE pack_id IN ({placeholders}) AND deleted_at IS NOT NULL",
+                    body.pack_ids,
+                )
+            else:
+                cur.execute(
+                    f"SELECT pack_id FROM resource_packs WHERE pack_id IN ({placeholders}) AND deleted_at IS NOT NULL AND admin_id = %s",
+                    body.pack_ids + [body.tg_uid],
+                )
+            valid_packs = [r["pack_id"] for r in cur.fetchall()]
+
+            if not valid_packs:
+                return {"code": 0, "message": "无可删除的包（仅回收站中的包可彻底删除）", "data": {"affected": 0, "channel_deleted": 0}}
+
+            vp = ",".join(["%s"] * len(valid_packs))
+
+            # 可选：清理 TG 频道消息
+            channel_deleted = 0
+            if body.clean_channel:
+                cur.execute(
+                    f"SELECT message_id FROM pack_items WHERE pack_id IN ({vp})",
+                    valid_packs,
+                )
+                msg_ids = [r["message_id"] for r in cur.fetchall()]
+                if msg_ids:
+                    channel_deleted = await _delete_channel_messages(msg_ids)
+
+            # 物理删除 DB 记录
+            cur.execute(f"DELETE FROM pack_codes WHERE pack_id IN ({vp})", valid_packs)
+            cur.execute(f"DELETE FROM pack_items WHERE pack_id IN ({vp})", valid_packs)
+            cur.execute(f"DELETE FROM resource_packs WHERE pack_id IN ({vp})", valid_packs)
+
+            return {
+                "code": 0,
+                "message": f"已彻底删除 {len(valid_packs)} 个",
+                "data": {"affected": len(valid_packs), "channel_deleted": channel_deleted},
+            }
     finally:
         conn.close()
 
