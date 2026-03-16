@@ -69,6 +69,10 @@ DISABLE_CHANNEL_BUTTON = os.environ.get("DISABLE_CHANNEL_BUTTON", True) == 'True
 VERIFY_API_BASE = os.environ.get("VERIFY_API_BASE", "https://xyjl.1yo.cc")
 VERIFY_API_KEY = os.environ.get("VERIFY_API_KEY", "07fe3ff58981bfb2bffcb164f002f514afea1abe7b114047")
 
+# 内部 API（供 Gateway 调用）
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "07fe3ff58981bfb2bffcb164f002f514afea1abe7b114047")
+INTERNAL_API_PORT = int(os.environ.get("INTERNAL_API_PORT", "18690"))
+
 # 存储 Session 配置
 STORE_SESSION_TIMEOUT = int(os.getenv("STORE_SESSION_TIMEOUT", "50"))  # 10分钟无操作自动关闭
 STORE_ALBUM_WAIT = float(os.getenv("STORE_ALBUM_WAIT", "0.5"))         # 相册消息合并等待秒数
