@@ -1074,7 +1074,7 @@ async def bind_guide_callback(client: Client, query: CallbackQuery):
                 if btn.callback_data == "bind_guide":
                     new_row.append(InlineKeyboardButton(
                         "🔗 前往绑定 ↗",
-                        url="https://t.me/moemoji_bot?start=bind",
+                        url="https://t.me/xiaoya_id_bot?start=bind",
                     ))
                 else:
                     new_row.append(btn)
