@@ -84,6 +84,7 @@ async def get_tags(
                 ) numbers
                 ON CHAR_LENGTH(rp.tags) - CHAR_LENGTH(REPLACE(rp.tags, ',', '')) >= numbers.n - 1
                 WHERE rp.status = 'done'
+                  AND rp.deleted_at IS NULL
                   AND rp.tags IS NOT NULL AND rp.tags != ''
                   {owner_cond}
                 GROUP BY tag_name
@@ -98,7 +99,8 @@ async def get_tags(
             cur.execute(
                 f"""
                 SELECT COUNT(*) AS cnt FROM resource_packs rp
-                WHERE rp.status = 'done' AND (rp.tags IS NULL OR rp.tags = '')
+                WHERE rp.status = 'done' AND rp.deleted_at IS NULL
+                  AND (rp.tags IS NULL OR rp.tags = '')
                 {owner_cond}
                 """,
                 owner_params,
@@ -107,7 +109,7 @@ async def get_tags(
 
             # 3. 总数
             cur.execute(
-                f"SELECT COUNT(*) AS cnt FROM resource_packs rp WHERE rp.status = 'done' {owner_cond}",
+                f"SELECT COUNT(*) AS cnt FROM resource_packs rp WHERE rp.status = 'done' AND rp.deleted_at IS NULL {owner_cond}",
                 owner_params,
             )
             total = cur.fetchone()["cnt"]
