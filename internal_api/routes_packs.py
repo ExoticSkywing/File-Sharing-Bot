@@ -325,7 +325,8 @@ async def update_pack(
                 params.append(body.name)
             if body.tags is not None:
                 updates.append("tags = %s")
-                params.append(body.tags)
+                # 去除标签首尾空格，避免匹配问题
+                params.append(body.tags.strip() if body.tags else body.tags)
 
             if not updates:
                 return {"code": 0, "message": "无需更新"}
