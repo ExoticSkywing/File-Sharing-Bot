@@ -925,7 +925,7 @@ async def _finalize_session(client: Client, session: StoreSession, status_messag
     if is_bound:
         manage_btn = InlineKeyboardButton(
             "◆ 管理我的空投包 ↗",
-            url="https://center.manyuzo.com/airdrop/packs",
+            url="https://center.manyuzo.com/#/airdrop/packs",
         )
     else:
         manage_btn = InlineKeyboardButton(
