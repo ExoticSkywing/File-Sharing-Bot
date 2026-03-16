@@ -73,12 +73,16 @@ class PackUpdateBody(BaseModel):
     name: Optional[str] = None
     tags: Optional[str] = None
     protect_content: Optional[str] = None  # "true" | "false" | "inherit" | None(不改)
+    max_claims_per_user: Optional[str] = None  # 数字字符串 | "inherit" | None(不改)
+    auto_delete_seconds: Optional[str] = None  # 数字字符串 | "inherit" | None(不改)
 
 
 class SettingsUpdateBody(BaseModel):
     tg_uid: int
     is_super: bool = False
     protect_content: Optional[bool] = None
+    max_claims_per_user: Optional[int] = None
+    auto_delete_time: Optional[int] = None
 
 
 class PackDeleteParams(BaseModel):
@@ -180,7 +184,8 @@ async def list_packs(
             cur.execute(
                 f"""
                 SELECT rp.pack_id, rp.admin_id, rp.item_count, rp.name, rp.tags,
-                       rp.created_at, rp.updated_at, rp.deleted_at, rp.protect_content
+                       rp.created_at, rp.updated_at, rp.deleted_at, rp.protect_content,
+                       rp.max_claims_per_user, rp.auto_delete_seconds
                 FROM resource_packs rp
                 WHERE {where_clause}
                 ORDER BY rp.created_at DESC
@@ -221,6 +226,8 @@ async def list_packs(
                     "name": p["name"],
                     "tags": p["tags"],
                     "protect_content": None if p["protect_content"] is None else bool(p["protect_content"]),
+                    "max_claims_per_user": p["max_claims_per_user"],
+                    "auto_delete_seconds": p["auto_delete_seconds"],
                     "created_at": str(p["created_at"]) if p["created_at"] else None,
                     "updated_at": str(p["updated_at"]) if p["updated_at"] else None,
                     "deleted_at": str(p["deleted_at"]) if p["deleted_at"] else None,
@@ -286,6 +293,8 @@ async def get_pack_detail(
                     "name": pack["name"],
                     "tags": pack["tags"],
                     "protect_content": None if pack.get("protect_content") is None else bool(pack["protect_content"]),
+                    "max_claims_per_user": pack.get("max_claims_per_user"),
+                    "auto_delete_seconds": pack.get("auto_delete_seconds"),
                     "created_at": str(pack["created_at"]) if pack["created_at"] else None,
                     "updated_at": str(pack["updated_at"]) if pack["updated_at"] else None,
                     "share_link": f"https://t.me/{bot_username}?start={b64}",
@@ -342,6 +351,18 @@ async def update_pack(
                 else:
                     updates.append("protect_content = %s")
                     params.append(1 if body.protect_content == "true" else 0)
+            if body.max_claims_per_user is not None:
+                if body.max_claims_per_user == "inherit":
+                    updates.append("max_claims_per_user = NULL")
+                else:
+                    updates.append("max_claims_per_user = %s")
+                    params.append(int(body.max_claims_per_user))
+            if body.auto_delete_seconds is not None:
+                if body.auto_delete_seconds == "inherit":
+                    updates.append("auto_delete_seconds = NULL")
+                else:
+                    updates.append("auto_delete_seconds = %s")
+                    params.append(int(body.auto_delete_seconds))
 
             if not updates:
                 return {"code": 0, "message": "无需更新"}
@@ -664,6 +685,8 @@ async def get_settings(
                 "code": 0,
                 "data": {
                     "protect_content": settings.get("protect_content", "true").lower() == "true",
+                    "max_claims_per_user": int(settings.get("max_claims_per_user", "0")),
+                    "auto_delete_time": int(settings.get("auto_delete_time", "0")),
                 },
                 "message": "ok",
             }
@@ -690,6 +713,18 @@ async def update_settings(
                     "INSERT INTO bot_settings (setting_key, setting_value) VALUES ('protect_content', %s) "
                     "ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
                     (val,),
+                )
+            if body.max_claims_per_user is not None:
+                cur.execute(
+                    "INSERT INTO bot_settings (setting_key, setting_value) VALUES ('max_claims_per_user', %s) "
+                    "ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+                    (str(body.max_claims_per_user),),
+                )
+            if body.auto_delete_time is not None:
+                cur.execute(
+                    "INSERT INTO bot_settings (setting_key, setting_value) VALUES ('auto_delete_time', %s) "
+                    "ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+                    (str(body.auto_delete_time),),
                 )
             return {"code": 0, "message": "设置已更新"}
     finally:

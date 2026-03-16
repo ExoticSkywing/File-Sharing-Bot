@@ -109,20 +109,21 @@ def get_readable_time(seconds: int) -> str:
     up_time += ":".join(time_list)
     return up_time
 
-async def delete_file(messages, client, process):
+async def delete_file(messages, client, process, auto_delete_time=None):
     """自动销毁文件（含二次提醒）"""
-    half_time = AUTO_DELETE_TIME // 2
+    delete_time = auto_delete_time if auto_delete_time is not None else AUTO_DELETE_TIME
+    half_time = delete_time // 2
     # 等待一半时间后发送二次提醒
     if half_time > 5:
         await asyncio.sleep(half_time)
-        remaining = AUTO_DELETE_TIME - half_time
+        remaining = delete_time - half_time
         try:
             await process.edit_text(f"⏳ 文件将在 {remaining} 秒后销毁，请尽快保存！")
         except Exception:
             pass
         await asyncio.sleep(remaining)
     else:
-        await asyncio.sleep(AUTO_DELETE_TIME)
+        await asyncio.sleep(delete_time)
 
     for msg in messages:
         try:

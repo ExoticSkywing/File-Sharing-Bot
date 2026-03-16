@@ -82,10 +82,23 @@ def _ensure_tables():
                     updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # 领取记录表
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pack_claims (
+                    id         INT AUTO_INCREMENT PRIMARY KEY,
+                    pack_id    VARCHAR(64) NOT NULL,
+                    user_id    BIGINT NOT NULL,
+                    claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_pack_user (pack_id, user_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
             # 初始化默认全局设置
-            cur.execute(
-                "INSERT IGNORE INTO bot_settings (setting_key, setting_value) VALUES ('protect_content', 'true')"
-            )
+            for setting_sql in [
+                "INSERT IGNORE INTO bot_settings (setting_key, setting_value) VALUES ('protect_content', 'true')",
+                "INSERT IGNORE INTO bot_settings (setting_key, setting_value) VALUES ('max_claims_per_user', '0')",
+                "INSERT IGNORE INTO bot_settings (setting_key, setting_value) VALUES ('auto_delete_time', '0')",
+            ]:
+                cur.execute(setting_sql)
             # 兼容：resource_packs 新增列（忽略已存在错误）
             for col_sql in [
                 "ALTER TABLE resource_packs ADD COLUMN name VARCHAR(255) DEFAULT NULL",
@@ -94,6 +107,8 @@ def _ensure_tables():
                 "ALTER TABLE resource_packs ADD COLUMN deleted_at DATETIME DEFAULT NULL",
                 "ALTER TABLE resource_packs ADD INDEX idx_deleted (deleted_at)",
                 "ALTER TABLE resource_packs ADD COLUMN protect_content BOOLEAN DEFAULT NULL",
+                "ALTER TABLE resource_packs ADD COLUMN max_claims_per_user INT DEFAULT NULL",
+                "ALTER TABLE resource_packs ADD COLUMN auto_delete_seconds INT DEFAULT NULL",
             ]:
                 try:
                     cur.execute(col_sql)
@@ -353,6 +368,67 @@ def get_pack_protect_content(pack_id: str) -> bool:
                 return bool(row[0])
             # 包级未设置，读取全局
             return get_setting('protect_content', 'true').lower() == 'true'
+    finally:
+        conn.close()
+
+
+def get_pack_max_claims(pack_id: str) -> int:
+    """获取空投包最终生效的单用户领取上限（包级优先 > 全局默认，0=不限）"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT max_claims_per_user FROM resource_packs WHERE pack_id = %s",
+                (pack_id,)
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+            return int(get_setting('max_claims_per_user', '0'))
+    finally:
+        conn.close()
+
+
+def get_pack_auto_delete(pack_id: str) -> int:
+    """获取空投包最终生效的自动删除秒数（包级优先 > 全局默认，0=不删除）"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT auto_delete_seconds FROM resource_packs WHERE pack_id = %s",
+                (pack_id,)
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+            return int(get_setting('auto_delete_time', '0'))
+    finally:
+        conn.close()
+
+
+def count_user_claims(pack_id: str, user_id: int) -> int:
+    """查询用户对某包的领取次数"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM pack_claims WHERE pack_id = %s AND user_id = %s",
+                (pack_id, user_id)
+            )
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def record_claim(pack_id: str, user_id: int):
+    """记录一次领取"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO pack_claims (pack_id, user_id) VALUES (%s, %s)",
+                (pack_id, user_id)
+            )
     finally:
         conn.close()
 

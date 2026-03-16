@@ -15,7 +15,12 @@ from config import (
     JOIN_REQUEST_ENABLE, FORCE_SUB_CHANNEL, CHANNEL_ID
 )
 from helper_func import subscribed, decode, get_messages, delete_file
-from database.database import add_user, del_user, full_userbase, present_user, get_pack_items, pack_exists, get_pack_protect_content
+from database.database import (
+    add_user, del_user, full_userbase, present_user,
+    get_pack_items, pack_exists, get_pack_protect_content,
+    get_pack_max_claims, get_pack_auto_delete,
+    count_user_claims, record_claim, get_setting,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,18 @@ def _apply_caption(msg, custom_caption):
 
 async def _deliver_pack(client: Client, message: Message, pack_id: str):
     """投递资源包到用户"""
+    user_id = message.from_user.id
+
+    # 领取次数检查
+    max_claims = get_pack_max_claims(pack_id)
+    if max_claims > 0:
+        used = count_user_claims(pack_id, user_id)
+        if used >= max_claims:
+            await message.reply_text(
+                f"⚠️ 你已领取过该资源包（{used}/{max_claims}次），无法再次领取。"
+            )
+            return
+
     items = get_pack_items(pack_id)
     if not items:
         await message.reply_text("❌ 资源包不存在或已过期")
@@ -37,6 +54,7 @@ async def _deliver_pack(client: Client, message: Message, pack_id: str):
 
     # 包级优先 > 全局默认
     pack_protect = get_pack_protect_content(pack_id)
+    pack_auto_delete = get_pack_auto_delete(pack_id)
 
     total = len(items)
     temp_msg = await message.reply(f"✨ 资源正在空投中，共 {total} 条，请稍候...")
@@ -99,7 +117,7 @@ async def _deliver_pack(client: Client, message: Message, pack_id: str):
                                 chat_id=message.from_user.id,
                                 protect_content=pack_protect
                             )
-                            if copied and AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
+                            if copied and pack_auto_delete > 0:
                                 track_msgs.append(copied)
                             sent += 1
                         except Exception as e:
@@ -140,13 +158,16 @@ async def _deliver_pack(client: Client, message: Message, pack_id: str):
 
     await temp_msg.delete()
 
-    # 自动销毁
-    if track_msgs and AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
+    # 记录领取
+    record_claim(pack_id, user_id)
+
+    # 自动销毁（包级优先）
+    if track_msgs and pack_auto_delete > 0:
         delete_data = await client.send_message(
             chat_id=message.from_user.id,
-            text=AUTO_DELETE_MSG.format(time=AUTO_DELETE_TIME)
+            text=AUTO_DELETE_MSG.format(time=pack_auto_delete)
         )
-        asyncio.create_task(delete_file(track_msgs, client, delete_data))
+        asyncio.create_task(delete_file(track_msgs, client, delete_data, pack_auto_delete))
 
 
 async def _send_single(client, message, msg_id, track_msgs, protect_content=None):
@@ -169,7 +190,7 @@ async def _send_single(client, message, msg_id, track_msgs, protect_content=None
             reply_markup=reply_markup,
             protect_content=protect_content
         )
-        if copied and AUTO_DELETE_TIME and AUTO_DELETE_TIME > 0:
+        if copied:
             track_msgs.append(copied)
     except FloodWait as e:
         await asyncio.sleep(e.value)
