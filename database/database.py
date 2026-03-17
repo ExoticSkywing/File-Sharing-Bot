@@ -225,6 +225,30 @@ def pack_exists(pack_id: str) -> bool:
         conn.close()
 
 
+def update_pack_meta(pack_id: str, tags: str = None, name: str = None):
+    """更新资源包的标签和备注（打包后元数据采集用）"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            updates = []
+            params = []
+            if tags is not None:
+                updates.append("tags = %s")
+                params.append(tags.strip() if tags else tags)
+            if name is not None:
+                updates.append("name = %s")
+                params.append(name.strip() if name else name)
+            if not updates:
+                return
+            params.append(pack_id)
+            cur.execute(
+                f"UPDATE resource_packs SET {', '.join(updates)} WHERE pack_id = %s",
+                params,
+            )
+    finally:
+        conn.close()
+
+
 def finish_pack(pack_id: str, item_count: int):
     """将资源包标记为完成"""
     conn = _get_conn()

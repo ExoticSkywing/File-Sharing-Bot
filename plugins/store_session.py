@@ -19,7 +19,7 @@ from pyrogram.errors import FloodWait
 from bot import Bot
 from config import ADMINS, CHANNEL_ID, STORE_SESSION_TIMEOUT, STORE_ALBUM_WAIT
 from helper_func import encode
-from database.database import create_pack, add_pack_item, update_pack_count, finish_pack, delete_pack, get_active_packs, get_pack_item_count, create_pack_code, check_tg_bindstatus
+from database.database import create_pack, add_pack_item, update_pack_count, finish_pack, delete_pack, get_active_packs, get_pack_item_count, create_pack_code, check_tg_bindstatus, update_pack_meta
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,38 @@ class StoreSession:
 
 # 全局活跃 Session 字典
 active_sessions: Dict[int, StoreSession] = {}
+
+# ==================== 打包后元数据采集 ====================
+
+POST_PACK_TIMEOUT = 60  # 每步超时秒数
+
+@dataclass
+class PostPackState:
+    """打包完成后的元数据采集状态"""
+    admin_id: int
+    pack_id: str
+    client: Client = None
+    phase: str = 'tags'       # 'tags' | 'notes'
+    link: str = ''
+    code: Optional[str] = None
+    item_count: int = 0
+    is_bound: bool = False
+    tags_text: Optional[str] = None   # 已采集的标签
+    status_message: Optional[Message] = None
+    timeout_task: Optional[asyncio.Task] = None
+
+# 全局打包后状态字典
+post_pack_states: Dict[int, PostPackState] = {}
+
+def get_post_pack_state(admin_id: int) -> Optional[PostPackState]:
+    """获取管理员当前的打包后状态"""
+    return post_pack_states.get(admin_id)
+
+def clear_post_pack_state(admin_id: int):
+    """清理打包后状态"""
+    state = post_pack_states.pop(admin_id, None)
+    if state and state.timeout_task and not state.timeout_task.done():
+        state.timeout_task.cancel()
 
 # ==================== TG 链接解析器 ====================
 
@@ -619,6 +651,13 @@ async def store_command(client: Client, message: Message):
 @Bot.on_message(filters.private & filters.user(ADMINS) & ~filters.command(['start', 'store', 'users', 'broadcast', 'stats']) & filters.incoming, group=-1)
 async def session_message_handler(client: Client, message: Message):
     """Session 期间拦截管理员发送的所有非命令消息"""
+    # 优先检查打包后元数据采集状态
+    post_state = get_post_pack_state(message.from_user.id)
+    if post_state and message.text:
+        await _handle_post_pack_message(client, message, post_state)
+        message.stop_propagation()
+        return
+
     session = get_session(message.from_user.id)
     if not session:
         return  # 没有活跃 Session，交给其他 handler
@@ -920,9 +959,111 @@ async def _finalize_session(client: Client, session: StoreSession, status_messag
         except Exception:
             code = None
 
-    # 检查管理员是否已绑定站点账号，决定按钮行为
+    # 检查管理员是否已绑定站点账号
     is_bound = check_tg_bindstatus(admin_id)
-    if is_bound:
+
+    # 进入打包后元数据采集流程
+    await _start_post_pack_tags(
+        client, admin_id, completed_session.pack_id,
+        link, code, item_count, is_bound, status_message
+    )
+
+# ==================== 打包后元数据采集流程 ====================
+
+async def _start_post_pack_tags(
+    client: Client, admin_id: int, pack_id: str,
+    link: str, code: str, item_count: int, is_bound: bool,
+    status_message: Message = None
+):
+    """第一步：提示输入标签"""
+    # 清理可能存在的旧状态
+    clear_post_pack_state(admin_id)
+
+    state = PostPackState(
+        admin_id=admin_id,
+        pack_id=pack_id,
+        client=client,
+        phase='tags',
+        link=link,
+        code=code,
+        item_count=item_count,
+        is_bound=is_bound,
+    )
+    post_pack_states[admin_id] = state
+
+    tag_prompt = (
+        "🏷 <b>是否为这个空投包添加标签？</b>\n\n"
+        "以空格分隔多个标签，例如：\n"
+        "<code>游戏 和平精英 无畏契约 三角洲 博主A</code>\n\n"
+        "标签可帮助你在后台快速分类和检索空投包。\n"
+        f"⏱ {POST_PACK_TIMEOUT} 秒内无操作将自动跳过"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ 跳过，不添加标签", callback_data=f"postpack_skip_tags_{pack_id}")]
+    ])
+
+    try:
+        if status_message:
+            msg = await status_message.edit_text(tag_prompt, reply_markup=keyboard)
+            state.status_message = status_message
+        else:
+            msg = await client.send_message(
+                chat_id=admin_id, text=tag_prompt, reply_markup=keyboard
+            )
+            state.status_message = msg
+    except Exception:
+        msg = await client.send_message(
+            chat_id=admin_id, text=tag_prompt, reply_markup=keyboard
+        )
+        state.status_message = msg
+
+    # 启动超时定时器
+    state.timeout_task = asyncio.create_task(_post_pack_timeout(admin_id, 'tags'))
+
+
+async def _start_post_pack_notes(state: PostPackState):
+    """第二步：提示输入备注"""
+    state.phase = 'notes'
+
+    # 取消旧超时
+    if state.timeout_task and not state.timeout_task.done():
+        state.timeout_task.cancel()
+
+    note_prompt = (
+        "📝 <b>是否为这个空投包添加备注？</b>\n\n"
+        "直接输入备注文字即可，例如：\n"
+        "<code>3月17日 XX频道合作资源</code>\n\n"
+        f"⏱ {POST_PACK_TIMEOUT} 秒内无操作将自动跳过"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ 跳过，直接完成", callback_data=f"postpack_skip_notes_{state.pack_id}")]
+    ])
+
+    try:
+        if state.status_message:
+            await state.status_message.edit_text(note_prompt, reply_markup=keyboard)
+        else:
+            msg = await state.client.send_message(
+                chat_id=state.admin_id, text=note_prompt, reply_markup=keyboard
+            )
+            state.status_message = msg
+    except Exception:
+        msg = await state.client.send_message(
+            chat_id=state.admin_id, text=note_prompt, reply_markup=keyboard
+        )
+        state.status_message = msg
+
+    # 启动新超时
+    state.timeout_task = asyncio.create_task(_post_pack_timeout(state.admin_id, 'notes'))
+
+
+async def _show_final_result(state: PostPackState):
+    """显示最终打包结果"""
+    clear_post_pack_state(state.admin_id)
+
+    if state.is_bound:
         manage_btn = InlineKeyboardButton(
             "◆ 管理我的空投包 ↗",
             url="https://center.manyuzo.com/#/airdrop/packs",
@@ -935,38 +1076,100 @@ async def _finalize_session(client: Client, session: StoreSession, status_messag
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(" 新建空投包", callback_data="store_new"),
+            InlineKeyboardButton("📦 新建空投包", callback_data="store_new"),
             manage_btn,
         ],
     ])
 
-    code_line = f"\n🔑 提货口令：<code>{code}</code>" if code else ""
+    code_line = f"\n🔑 提货口令：<code>{state.code}</code>" if state.code else ""
+    tags_line = f"\n🏷 标签：{state.tags_text}" if state.tags_text else ""
+    # 从 DB 读取 name（备注）比较复杂，直接用内存中的状态
+    # 备注信息在 _handle_post_pack_notes 中已写入 DB
+
     result_text = (
         f"🎉 <b>空投包已生成！</b>\n\n"
-        f"📊 已存入 <b>{item_count}</b> 项资源\n"
-        f"🔗 分享链接：\n<code>{link}</code>"
-        f"{code_line}"
+        f"📊 已存入 <b>{state.item_count}</b> 项资源\n"
+        f"🔗 分享链接：\n<code>{state.link}</code>"
+        f"{code_line}{tags_line}"
     )
 
-    if status_message:
+    try:
+        if state.status_message:
+            await state.status_message.edit_text(result_text, reply_markup=keyboard)
+        else:
+            await state.client.send_message(
+                chat_id=state.admin_id, text=result_text, reply_markup=keyboard
+            )
+    except Exception:
         try:
-            await status_message.edit_text(result_text, reply_markup=keyboard)
-        except Exception:
-            # 编辑失败则直接发新消息
-            try:
-                await client.send_message(
-                    chat_id=admin_id, text=result_text, reply_markup=keyboard
-                )
-            except Exception:
-                pass
-    else:
-        # 没有 status_message（如超时场景）直接发新消息
-        try:
-            await client.send_message(
-                chat_id=admin_id, text=result_text, reply_markup=keyboard
+            await state.client.send_message(
+                chat_id=state.admin_id, text=result_text, reply_markup=keyboard
             )
         except Exception:
             pass
+
+
+async def _post_pack_timeout(admin_id: int, phase: str):
+    """打包后元数据采集超时处理"""
+    try:
+        await asyncio.sleep(POST_PACK_TIMEOUT)
+        state = get_post_pack_state(admin_id)
+        if not state:
+            return
+        if phase == 'tags' and state.phase == 'tags':
+            # 标签超时 → 跳到备注
+            await _start_post_pack_notes(state)
+        elif phase == 'notes' and state.phase == 'notes':
+            # 备注超时 → 显示最终结果
+            await _show_final_result(state)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.warning(f"打包后超时处理异常: {e}")
+        clear_post_pack_state(admin_id)
+
+
+async def _handle_post_pack_message(client: Client, message: Message, state: PostPackState):
+    """处理打包后元数据采集阶段收到的文本消息"""
+    text = message.text.strip()
+
+    if state.phase == 'tags':
+        # 空格分割标签，转为逗号分割存入 DB
+        tags = [t.strip() for t in text.split() if t.strip()]
+        if tags:
+            tags_csv = ','.join(tags)
+            try:
+                update_pack_meta(state.pack_id, tags=tags_csv)
+                state.tags_text = ' '.join(tags)
+                await message.reply_text(
+                    f"✅ 已添加 {len(tags)} 个标签：{' '.join(tags)}",
+                    quote=True
+                )
+            except Exception as e:
+                logger.warning(f"标签写入失败: {e}")
+                await message.reply_text("⚠️ 标签保存失败，已跳过", quote=True)
+        else:
+            await message.reply_text("ℹ️ 未检测到有效标签，已跳过", quote=True)
+
+        # 进入备注阶段
+        await _start_post_pack_notes(state)
+
+    elif state.phase == 'notes':
+        # 直接保存备注
+        if text:
+            try:
+                update_pack_meta(state.pack_id, name=text)
+                await message.reply_text(
+                    f"✅ 已添加备注：{text}",
+                    quote=True
+                )
+            except Exception as e:
+                logger.warning(f"备注写入失败: {e}")
+                await message.reply_text("⚠️ 备注保存失败，已跳过", quote=True)
+
+        # 显示最终结果
+        await _show_final_result(state)
+
 
 # ==================== 回调按钮处理 ====================
 
@@ -1011,10 +1214,32 @@ async def store_callback(client: Client, query: CallbackQuery):
         await query.answer("已取消")
 
 
+@Bot.on_callback_query(filters.regex(r'^postpack_skip_(tags|notes)_') & filters.user(ADMINS))
+async def postpack_skip_callback(client: Client, query: CallbackQuery):
+    """处理打包后元数据采集的跳过按钮"""
+    data = query.data
+    admin_id = query.from_user.id
+    state = get_post_pack_state(admin_id)
+
+    if not state:
+        await query.answer("⚠️ 采集已结束", show_alert=False)
+        return
+
+    if data.startswith("postpack_skip_tags_"):
+        await query.answer("已跳过标签", show_alert=False)
+        await _start_post_pack_notes(state)
+    elif data.startswith("postpack_skip_notes_"):
+        await query.answer("已跳过备注", show_alert=False)
+        await _show_final_result(state)
+
+
 @Bot.on_callback_query(filters.regex(r'^store_new$') & filters.user(ADMINS))
 async def store_new_callback(client: Client, query: CallbackQuery):
     """点击「新建空投包」直接开启下一个 Session"""
     admin_id = query.from_user.id
+
+    # 清理可能残留的打包后状态
+    clear_post_pack_state(admin_id)
 
     # 如有旧 Session 先关闭
     if get_session(admin_id):
