@@ -1026,8 +1026,9 @@ async def _start_post_pack_notes(state: PostPackState):
     """第二步：提示输入备注"""
     state.phase = 'notes'
 
-    # 取消旧超时
-    if state.timeout_task and not state.timeout_task.done():
+    # 取消旧超时（避免取消自身：超时回调也会调用此函数）
+    current = asyncio.current_task()
+    if state.timeout_task and state.timeout_task is not current and not state.timeout_task.done():
         state.timeout_task.cancel()
 
     note_prompt = (
@@ -1061,7 +1062,12 @@ async def _start_post_pack_notes(state: PostPackState):
 
 async def _show_final_result(state: PostPackState):
     """显示最终打包结果"""
-    clear_post_pack_state(state.admin_id)
+    # 安全清理：不取消当前正在执行的超时任务（可能就是调用者）
+    admin_id = state.admin_id
+    post_pack_states.pop(admin_id, None)
+    current = asyncio.current_task()
+    if state.timeout_task and state.timeout_task is not current and not state.timeout_task.done():
+        state.timeout_task.cancel()
 
     if state.is_bound:
         manage_btn = InlineKeyboardButton(
