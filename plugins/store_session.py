@@ -212,8 +212,9 @@ def generate_code() -> str:
 
 async def start_session(admin_id: int, client: Client = None) -> StoreSession:
     """创建一个新的存储 Session"""
-    # 如果已有活跃 Session，先关闭
+    # 防御性检查：正常流程不应走到这里
     if admin_id in active_sessions:
+        logger.warning(f"意外的重复 Session，强制关闭旧会话: {admin_id}")
         await close_session(admin_id, cancelled=True)
 
     pack_id = generate_pack_id()
@@ -631,8 +632,21 @@ async def store_command(client: Client, message: Message):
     """管理员发送 /store 进入存储模式"""
     admin_id = message.from_user.id
 
-    # 如果正在标签/备注采集阶段，清理后开新 session
-    clear_post_pack_state(admin_id)
+    # 已有活跃存储会话 → 拒绝
+    if get_session(admin_id):
+        await message.reply_text(
+            "⚠️ 当前有进行中的存储任务，请先完成打包",
+            quote=True,
+        )
+        return
+
+    # 正在标签/备注采集阶段 → 拒绝
+    if get_post_pack_state(admin_id):
+        await message.reply_text(
+            "⚠️ 当前空投包正在补充信息，请先完成或跳过",
+            quote=True,
+        )
+        return
 
     session = await start_session(admin_id, client=client)
 
@@ -1251,12 +1265,13 @@ async def store_new_callback(client: Client, query: CallbackQuery):
     """点击「新建空投包」直接开启下一个 Session"""
     admin_id = query.from_user.id
 
-    # 清理可能残留的打包后状态
-    clear_post_pack_state(admin_id)
-
-    # 如有旧 Session 先关闭
+    # 防御：此按钮只在最终结果消息出现，正常不会有冲突
     if get_session(admin_id):
-        await close_session(admin_id, cancelled=True)
+        await query.answer("⚠️ 当前有进行中的存储任务，请先完成", show_alert=True)
+        return
+    if get_post_pack_state(admin_id):
+        await query.answer("⚠️ 当前空投包正在补充信息，请先完成", show_alert=True)
+        return
 
     session = await start_session(admin_id, client=client)
 
