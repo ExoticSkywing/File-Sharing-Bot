@@ -61,7 +61,8 @@ active_sessions: Dict[int, StoreSession] = {}
 
 # ==================== 打包后元数据采集 ====================
 
-POST_PACK_TIMEOUT = 60  # 每步超时秒数
+# 打包后元数据采集超时 = 会话超时（不单独设置）
+POST_PACK_TIMEOUT = STORE_SESSION_TIMEOUT
 
 @dataclass
 class PostPackState:
@@ -628,7 +629,12 @@ async def _refresh_status_message(client: Client, reply_msg: Message, session: S
 @Bot.on_message(filters.command('store') & filters.private & filters.user(ADMINS))
 async def store_command(client: Client, message: Message):
     """管理员发送 /store 进入存储模式"""
-    session = await start_session(message.from_user.id, client=client)
+    admin_id = message.from_user.id
+
+    # 如果正在标签/备注采集阶段，清理后开新 session
+    clear_post_pack_state(admin_id)
+
+    session = await start_session(admin_id, client=client)
 
     welcome_text = (
         "📦 <b>存储模式已开启</b>\n\n"
@@ -991,32 +997,31 @@ async def _start_post_pack_tags(
     )
     post_pack_states[admin_id] = state
 
+    timeout_hint = f"⏱ {POST_PACK_TIMEOUT // 60} 分钟内无操作将自动跳过" if POST_PACK_TIMEOUT >= 60 else f"⏱ {POST_PACK_TIMEOUT} 秒内无操作将自动跳过"
     tag_prompt = (
         "🏷 <b>是否为这个空投包添加标签？</b>\n\n"
         "以空格分隔多个标签，例如：\n"
         "<code>游戏 和平精英 无畏契约 三角洲 博主A</code>\n\n"
         "标签可帮助你在后台快速分类和检索空投包。\n"
-        f"⏱ {POST_PACK_TIMEOUT} 秒内无操作将自动跳过"
+        f"{timeout_hint}"
     )
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭ 跳过，不添加标签", callback_data=f"postpack_skip_tags_{pack_id}")]
     ])
 
-    try:
-        if status_message:
-            msg = await status_message.edit_text(tag_prompt, reply_markup=keyboard)
-            state.status_message = status_message
-        else:
-            msg = await client.send_message(
-                chat_id=admin_id, text=tag_prompt, reply_markup=keyboard
-            )
-            state.status_message = msg
-    except Exception:
-        msg = await client.send_message(
-            chat_id=admin_id, text=tag_prompt, reply_markup=keyboard
-        )
-        state.status_message = msg
+    # 清除旧 status_message 的按钮，避免悬空
+    if status_message:
+        try:
+            await status_message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    # 发送新消息（不 edit 旧消息，确保用户在聊天底部看到提示）
+    msg = await client.send_message(
+        chat_id=admin_id, text=tag_prompt, reply_markup=keyboard
+    )
+    state.status_message = msg
 
     # 启动超时定时器
     state.timeout_task = asyncio.create_task(_post_pack_timeout(admin_id, 'tags'))
@@ -1031,30 +1036,31 @@ async def _start_post_pack_notes(state: PostPackState):
     if state.timeout_task and state.timeout_task is not current and not state.timeout_task.done():
         state.timeout_task.cancel()
 
+    timeout_hint = f"⏱ {POST_PACK_TIMEOUT // 60} 分钟内无操作将自动跳过" if POST_PACK_TIMEOUT >= 60 else f"⏱ {POST_PACK_TIMEOUT} 秒内无操作将自动跳过"
     note_prompt = (
         "📝 <b>是否为这个空投包添加备注？</b>\n\n"
         "直接输入备注文字即可，例如：\n"
         "<code>3月17日 XX频道合作资源</code>\n\n"
-        f"⏱ {POST_PACK_TIMEOUT} 秒内无操作将自动跳过"
+        f"{timeout_hint}"
     )
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭ 跳过，直接完成", callback_data=f"postpack_skip_notes_{state.pack_id}")]
     ])
 
-    try:
-        if state.status_message:
-            await state.status_message.edit_text(note_prompt, reply_markup=keyboard)
-        else:
-            msg = await state.client.send_message(
-                chat_id=state.admin_id, text=note_prompt, reply_markup=keyboard
-            )
-            state.status_message = msg
-    except Exception:
-        msg = await state.client.send_message(
-            chat_id=state.admin_id, text=note_prompt, reply_markup=keyboard
-        )
-        state.status_message = msg
+    # 删除旧标签提示消息，保持界面清爽
+    if state.status_message:
+        try:
+            await state.status_message.delete()
+        except Exception:
+            pass
+        state.status_message = None
+
+    # 发送新消息
+    msg = await state.client.send_message(
+        chat_id=state.admin_id, text=note_prompt, reply_markup=keyboard
+    )
+    state.status_message = msg
 
     # 启动新超时
     state.timeout_task = asyncio.create_task(_post_pack_timeout(state.admin_id, 'notes'))
@@ -1087,32 +1093,33 @@ async def _show_final_result(state: PostPackState):
         ],
     ])
 
-    code_line = f"\n🔑 提货口令：<code>{state.code}</code>" if state.code else ""
+    code_line = f"\n\n🔑 口令：<code>{state.code}</code>" if state.code else ""
     tags_line = f"\n🏷 标签：{state.tags_text}" if state.tags_text else ""
-    # 从 DB 读取 name（备注）比较复杂，直接用内存中的状态
-    # 备注信息在 _handle_post_pack_notes 中已写入 DB
 
     result_text = (
         f"🎉 <b>空投包已生成！</b>\n\n"
-        f"📊 已存入 <b>{state.item_count}</b> 项资源\n"
-        f"🔗 分享链接：\n<code>{state.link}</code>"
-        f"{code_line}{tags_line}"
+        f"📊 共 <b>{state.item_count}</b> 项资源\n\n"
+        f"🔗 分享链接\n"
+        f"<code>{state.link}</code>"
+        f"{code_line}"
+        f"{tags_line}"
     )
 
-    try:
-        if state.status_message:
-            await state.status_message.edit_text(result_text, reply_markup=keyboard)
-        else:
-            await state.client.send_message(
-                chat_id=state.admin_id, text=result_text, reply_markup=keyboard
-            )
-    except Exception:
+    # 删除旧备注提示消息
+    if state.status_message:
         try:
-            await state.client.send_message(
-                chat_id=state.admin_id, text=result_text, reply_markup=keyboard
-            )
+            await state.status_message.delete()
         except Exception:
             pass
+        state.status_message = None
+
+    # 发送新消息展示最终结果
+    try:
+        await state.client.send_message(
+            chat_id=state.admin_id, text=result_text, reply_markup=keyboard
+        )
+    except Exception:
+        pass
 
 
 async def _post_pack_timeout(admin_id: int, phase: str):
